@@ -43,3 +43,17 @@ class ExtractionResult(BaseModel):
     attributes: list[ExtractedAttribute] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     conflicts: list[AttributeConflict] = Field(default_factory=list)
+
+
+class DescriptionAttribute(BaseModel):
+    """Характеристика, которую модель нашла в тексте описания."""
+
+    name: str
+    value: str
+    evidence: str
+
+
+class DescriptionExtraction(BaseModel):
+    """Структурированный ответ LLM по текстовому описанию."""
+
+    attributes: list[DescriptionAttribute] = Field(default_factory=list)

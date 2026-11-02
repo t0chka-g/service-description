@@ -510,5 +510,149 @@
     },
     "missing_fields": ["класс точности"],
     "conflicts": []
+  },
+  {
+    "id": "value_not_in_quote",
+    "description": "Цитата есть в тексте, но не содержит заявленное значение",
+    "input": {
+      "name": "Манометр показывающий МП-У-05",
+      "manufacturer": "ИзмерТех",
+      "specs": {},
+      "description": "Манометр для воды. Диапазон измерений указан в паспорте."
+    },
+    "required_fields": ["класс точности"],
+    "llm_response": {
+      "attributes": [
+        {
+          "name": "класс точности",
+          "value": "0,05",
+          "evidence": "Диапазон измерений указан"
+        }
+      ]
+    },
+    "expected": {},
+    "missing_fields": ["класс точности"],
+    "conflicts": []
+  },
+  {
+    "id": "short_quote_without_value",
+    "description": "Короткая цитата не содержит заявленное значение",
+    "input": {
+      "name": "Уровнемер УУЗ-У-1",
+      "manufacturer": "АкустикаИзм",
+      "specs": {},
+      "description": "Измерение до 5 м."
+    },
+    "required_fields": ["давление"],
+    "llm_response": {
+      "attributes": [
+        {
+          "name": "давление",
+          "value": "100 МПа",
+          "evidence": "м"
+        }
+      ]
+    },
+    "expected": {},
+    "missing_fields": ["давление"],
+    "conflicts": []
+  },
+  {
+    "id": "padded_quote_is_trimmed",
+    "description": "Пробелы по краям цитаты не сохраняются в ответе",
+    "input": {
+      "name": "Датчик давления ДД-У-24",
+      "manufacturer": "СенсорПром",
+      "specs": {},
+      "description": "Питание 24 В DC. Корпус пластиковый."
+    },
+    "required_fields": ["питание"],
+    "llm_response": {
+      "attributes": [
+        {
+          "name": "питание",
+          "value": "24 В DC",
+          "evidence": "  Питание 24 В DC"
+        }
+      ]
+    },
+    "expected": {
+      "питание": {
+        "value": "24 В DC",
+        "source": "description",
+        "evidence": "Питание 24 В DC"
+      }
+    },
+    "missing_fields": [],
+    "conflicts": []
+  },
+  {
+    "id": "conflict_quote_without_value",
+    "description": "Цитата конфликта не содержит заявленное значение",
+    "input": {
+      "name": "Манометр МП-У-10",
+      "manufacturer": "ИзмерТех",
+      "specs": {
+        "диапазон измерений": "0...1,0 МПа"
+      },
+      "description": "Манометр для воды. Диапазон измерений указан в паспорте."
+    },
+    "required_fields": ["диапазон измерений"],
+    "llm_response": {
+      "attributes": [
+        {
+          "name": "диапазон измерений",
+          "value": "0...25 МПа",
+          "evidence": "в паспорте"
+        }
+      ]
+    },
+    "expected": {
+      "диапазон измерений": {
+        "value": "0...1,0 МПа",
+        "source": "specs",
+        "evidence": "0...1,0 МПа"
+      }
+    },
+    "missing_fields": [],
+    "conflicts": []
+  },
+  {
+    "id": "spec_key_case_mismatch",
+    "description": "Ключ spec отличается регистром от требуемого поля",
+    "input": {
+      "name": "Манометр МП-У-15",
+      "manufacturer": "ИзмерТех",
+      "specs": {
+        "Класс точности": "1,5"
+      },
+      "description": "Класс точности 2,5."
+    },
+    "required_fields": ["класс точности"],
+    "llm_response": {
+      "attributes": [
+        {
+          "name": "класс точности",
+          "value": "2,5",
+          "evidence": "Класс точности 2,5"
+        }
+      ]
+    },
+    "expected": {
+      "класс точности": {
+        "value": "1,5",
+        "source": "specs",
+        "evidence": "1,5"
+      }
+    },
+    "missing_fields": [],
+    "conflicts": [
+      {
+        "name": "класс точности",
+        "specs_value": "1,5",
+        "description_value": "2,5",
+        "evidence": "Класс точности 2,5"
+      }
+    ]
   }
 ]

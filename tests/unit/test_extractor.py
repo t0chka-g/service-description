@@ -17,6 +17,16 @@ def _attributes_by_name(result: ExtractionResult) -> dict[str, Any]:
     return {item.name: item for item in result.attributes}
 
 
+def _spec_value(product: ProductInput, name: str) -> str:
+    if name in product.specs:
+        return product.specs[name]
+    folded = name.strip().casefold()
+    for key, value in product.specs.items():
+        if key.strip().casefold() == folded:
+            return value
+    raise AssertionError(name)
+
+
 def _assert_evidence_from_source(
     product: ProductInput,
     actual: ExtractedAttribute,
@@ -24,8 +34,9 @@ def _assert_evidence_from_source(
 ) -> None:
     assert expected_evidence in actual.evidence
     if actual.source is AttributeSource.SPECS:
-        assert actual.value == product.specs[actual.name]
-        assert actual.evidence in product.specs[actual.name]
+        spec_value = _spec_value(product, actual.name)
+        assert actual.value == spec_value
+        assert actual.evidence in spec_value
     elif actual.source is AttributeSource.DESCRIPTION:
         assert actual.evidence in product.description
         assert actual.evidence != product.description
@@ -51,6 +62,11 @@ def _conflicts_by_name(result: ExtractionResult) -> dict[str, Any]:
         "empty_invalid_input",
         "prompt_injection_no_hallucination",
         "unsupported_llm_attribute",
+        "value_not_in_quote",
+        "short_quote_without_value",
+        "padded_quote_is_trimmed",
+        "conflict_quote_without_value",
+        "spec_key_case_mismatch",
     ],
 )
 async def test_extract_matches_case_contract(

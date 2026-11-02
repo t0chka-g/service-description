@@ -5,7 +5,6 @@ from fastapi import FastAPI
 
 from app.api.routes import router
 
-
 """Создание FastAPI приложения"""
 app = FastAPI(
     title="AI Product Card Generator",
