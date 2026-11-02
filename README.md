@@ -58,8 +58,18 @@ curl http://127.0.0.1:8000/health
 ## Тесты
 
 ```bash
-uv run pytest -m "not llm"
+uv run pytest
 ```
+
+`pytest` по умолчанию исключает маркер `llm`. Тот же фильтр стоит в CI.
+
+Реальный прогон оценки извлечения вызывает OpenAI и пишет отчёт в `reports/evals/` (каталог в `.gitignore`):
+
+```bash
+uv run pytest -m llm -v
+```
+
+Без `OPENAI_API_KEY` этот тест пропускается. Precision, Recall и F1 в отчёте относятся к характеристикам из описания; копирование `specs` в них не входит. Hallucination Rate считается по сырому ответу модели. Ошибки API лежат отдельно от метрик качества.
 
 CI (`.github/workflows/ci.yml`) на каждом push/PR выполняет `uv sync --locked --extra dev`, затем ruff и pytest.
 

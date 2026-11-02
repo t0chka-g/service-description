@@ -32,6 +32,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = "-m 'not llm'"
 markers = [
     "llm: evaluation tests that may call a real LLM (opt-in via -m llm)",
 ]

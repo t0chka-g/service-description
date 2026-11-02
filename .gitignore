@@ -208,6 +208,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Local LLM evaluation reports
+reports/evals/
+
 # PyPI configuration file
 .pypirc
 

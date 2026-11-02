@@ -1,5 +1,6 @@
 """Клиент OpenAI API с возможностью подмены в тестах."""
 
+from enum import StrEnum
 from typing import Protocol
 
 from openai import AsyncOpenAI, OpenAIError
@@ -9,8 +10,19 @@ from app.schemas.product import DescriptionExtraction
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
+class LLMErrorKind(StrEnum):
+    """Технический сбой API отдельно от ответа, который не удалось разобрать."""
+
+    API = "api"
+    MODEL = "model"
+
+
 class LLMError(Exception):
     """Ошибка вызова модели или разбора ее ответа."""
+
+    def __init__(self, message: str, *, kind: LLMErrorKind = LLMErrorKind.MODEL) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class LLMClient(Protocol):
@@ -29,15 +41,20 @@ class OpenAILLMClient:
         *,
         api_key: str,
         model: str,
+        base_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if not api_key.strip():
-            raise LLMError("OPENAI_API_KEY is empty")
+            raise LLMError("OPENAI_API_KEY is empty", kind=LLMErrorKind.API)
         if not model.strip():
-            raise LLMError("OPENAI_MODEL is empty")
+            raise LLMError("OPENAI_MODEL is empty", kind=LLMErrorKind.API)
         self._model = model
         self._timeout = timeout
-        self._client = AsyncOpenAI(api_key=api_key, timeout=timeout)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url or None,
+            timeout=timeout,
+        )
 
     async def complete(self, prompt: str) -> str:
         try:
@@ -48,7 +65,7 @@ class OpenAILLMClient:
                 timeout=self._timeout,
             )
         except OpenAIError as exc:
-            raise LLMError("OpenAI request failed") from exc
+            raise LLMError("OpenAI request failed", kind=LLMErrorKind.API) from exc
 
         if not completion.choices:
             raise LLMError("structured response is empty")
