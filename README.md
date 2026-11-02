@@ -15,6 +15,17 @@ AI-сервис на FastAPI для генерации SEO-карточек то
 
 ## Установка
 
+Рекомендуется [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync --locked --extra dev
+cp .env.example .env
+```
+
+`uv sync --locked` ставит зависимости строго по `uv.lock` и завершается ошибкой, если lock не соответствует `pyproject.toml`. Так локально и в CI получается одно и то же окружение.
+
+Альтернатива через pip:
+
 ```bash
 python -m venv .venv
 
@@ -47,8 +58,10 @@ curl http://127.0.0.1:8000/health
 ## Тесты
 
 ```bash
-pytest
+uv run pytest -m "not llm"
 ```
+
+CI (`.github/workflows/ci.yml`) на каждом push/PR выполняет `uv sync --locked --extra dev`, затем ruff и pytest.
 
 ## Версионирование
 

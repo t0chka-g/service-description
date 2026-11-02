@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (locked)
+        # --locked: не обновляет uv.lock; падает, если lock не соответствует pyproject.toml
+        run: uv sync --locked --extra dev
+
+      - name: Ruff
+        run: uv run ruff check app tests
+
+      - name: Pytest
+        run: uv run pytest -m "not llm"
