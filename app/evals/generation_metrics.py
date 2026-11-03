@@ -58,10 +58,20 @@ def count_rate(numerator: int, denominator: int) -> CountRate:
     )
 
 
-def usage_cost(usages: list[LLMUsage], price: ModelPrice | None) -> UsageCost:
-    prompt_tokens = sum(item.prompt_tokens for item in usages)
-    completion_tokens = sum(item.completion_tokens for item in usages)
-    if price is None or not usages:
+def usage_cost(usages: list[LLMUsage | None], price: ModelPrice | None) -> UsageCost:
+    """Стоимость только при полном usage и тарифе. Иначе cost is None."""
+
+    present = [item for item in usages if item is not None]
+    prompt_tokens = sum(item.prompt_tokens for item in present)
+    completion_tokens = sum(item.completion_tokens for item in present)
+    if (
+        price is None
+        or not usages
+        or len(present) != len(usages)
+        or any(
+            item.prompt_tokens < 0 or item.completion_tokens < 0 for item in present
+        )
+    ):
         return UsageCost(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -76,6 +86,33 @@ def usage_cost(usages: list[LLMUsage], price: ModelPrice | None) -> UsageCost:
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         cost=cost,
+        priced=True,
+    )
+
+
+def aggregate_costs(
+    entries: list[tuple[bool, UsageCost | None]],
+) -> UsageCost:
+    """Сумма стоимости. Если хотя бы один вызов без цены — cost is None."""
+
+    called = [(called, cost) for called, cost in entries if called]
+    present = [cost for _, cost in called if cost is not None]
+    prompt_tokens = sum(item.prompt_tokens for item in present)
+    completion_tokens = sum(item.completion_tokens for item in present)
+    complete = bool(called) and all(
+        cost is not None and cost.priced and cost.cost is not None for _, cost in called
+    )
+    if not complete:
+        return UsageCost(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost=None,
+            priced=False,
+        )
+    return UsageCost(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost=sum(item.cost for item in present if item.cost is not None),
         priced=True,
     )
 

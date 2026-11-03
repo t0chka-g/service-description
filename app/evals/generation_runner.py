@@ -24,11 +24,13 @@ from app.evals.generation_metrics import (
     GenerationRates,
     ModelPrice,
     UsageCost,
+    aggregate_costs,
     count_rate,
     mean,
     usage_cost,
 )
-from app.evals.judge import JudgeAssessment, JudgeVerdict
+from app.evals.judge import JudgeAssessment
+from app.evals.judge_checks import JudgeCheckResult, check_judge_assessment
 from app.prompts.generation import build_generation_prompt
 from app.prompts.judge import build_judge_prompt
 from app.schemas.product import (
@@ -60,15 +62,16 @@ GENERATION_EVAL_METHOD = (
     "Судья вызывается только после успешной генерации и другой моделью, "
     "если конфигурация ее задает. Его отказ — judge_error без фиктивной "
     "оценки; генерация при этом остается валидной. "
-    "semantic_issue_rate считает разборы судьи с неподтвержденными "
-    "утверждениями, противоречиями или critical_errors. "
-    "Это не ошибка детерминированной валидации. "
-    "Оценка судьи не является истиной: verdict review, противоречие между "
-    "pass и списком претензий, а также factual score ниже 3 при pass "
-    "попадают в ручную проверку. "
+    "semantic_issue_rate считает только согласованные разборы судьи с "
+    "подтвержденными цитатами из карточки и critical_errors. "
+    "Выдуманные цитаты и внутренние противоречия verdict/evidence не "
+    "повышают semantic_issue_rate: такой ответ идет в needs_manual_review "
+    "или judge_error. "
+    "Оценка судьи не является истиной. "
     "Температура фиксируется в отчете и не означает детерминизм. "
     "Стоимость считается по usage ответа и тарифу модели. Без usage или "
-    "тарифа cost равен null."
+    "тарифа у любого учтенного вызова агрегированный cost равен null, "
+    "а не частичной сумме."
 )
 
 _SAFE_MODEL = re.compile(r"[^\w.\-]+", re.UNICODE)
@@ -114,6 +117,7 @@ class GenerationScenarioReport(BaseModel):
     judge: JudgeAssessment | None = None
     judge_usage: LLMUsage | None = None
     judge_cost: UsageCost | None = None
+    confirmed_semantic_issue: bool = False
     needs_manual_review: bool = False
     manual_review_reason: str = ""
 
@@ -244,16 +248,17 @@ def build_generation_report(
         for item in scenarios
         if item.status in {GenerationRunStatus.GENERATED, GenerationRunStatus.JUDGE_ERROR}
     ]
-    judged = [item for item in scenarios if item.judge is not None]
-    semantic = [
+    judged = [
         item
-        for item in judged
-        if item.judge is not None and _semantic_issue(item.judge)
+        for item in scenarios
+        if item.judge is not None and item.judge_status is JudgeRunStatus.SCORED
     ]
+    semantic = [item for item in judged if item.confirmed_semantic_issue]
     latencies = [
         item.latency_seconds
         for item in scenarios
-        if item.model_called and item.latency_seconds is not None
+        if item.latency_seconds is not None
+        and (item.model_called or item.status is GenerationRunStatus.API_ERROR)
     ]
     return GenerationEvaluationReport(
         created_at=created,
@@ -330,8 +335,15 @@ def build_generation_report(
         ),
         judged_count=len(judged),
         mean_latency_seconds=mean(latencies),
-        generation_cost=_sum_costs([item.cost for item in scenarios]),
-        judge_cost=_sum_costs([item.judge_cost for item in scenarios]),
+        generation_cost=aggregate_costs(
+            [(item.model_called, item.cost) for item in scenarios]
+        ),
+        judge_cost=aggregate_costs(
+            [
+                (item.judge_status is not JudgeRunStatus.SKIPPED, item.judge_cost)
+                for item in scenarios
+            ]
+        ),
         scenarios=list(scenarios),
     )
 
@@ -369,12 +381,22 @@ class _RecordingClient:
         self._inner = inner
         self.responses: list[str] = []
         self.metas: list[LLMCallMeta | None] = []
+        self.attempted = False
 
     async def complete(self, prompt: str, *, response_model: object = None) -> str:
-        if response_model is None:
-            response = await self._inner.complete(prompt)
-        else:
-            response = await self._inner.complete(prompt, response_model=response_model)
+        self.attempted = True
+        try:
+            if response_model is None:
+                response = await self._inner.complete(prompt)
+            else:
+                response = await self._inner.complete(
+                    prompt,
+                    response_model=response_model,
+                )
+        except BaseException:
+            meta = getattr(self._inner, "last_call", None)
+            self.metas.append(meta if isinstance(meta, LLMCallMeta) else None)
+            raise
         self.responses.append(response)
         meta = getattr(self._inner, "last_call", None)
         self.metas.append(meta if isinstance(meta, LLMCallMeta) else None)
@@ -410,8 +432,8 @@ async def _run_case(
             eligible=eligible,
             error_message=str(exc),
             judge_status=JudgeRunStatus.SKIPPED,
-            model_called=bool(recorder.responses),
-            latency=latency if recorder.responses else None,
+            model_called=recorder.attempted or bool(recorder.responses),
+            latency=latency if recorder.attempted or recorder.responses else None,
             meta=meta,
             price=generator_price,
             checks=assess_draft(raw),
@@ -425,6 +447,7 @@ async def _run_case(
             case,
             status=GenerationRunStatus.INSUFFICIENT_DATA,
             eligible=False,
+            error_message=None,
             judge_status=JudgeRunStatus.SKIPPED,
             model_called=False,
             latency=None,
@@ -446,7 +469,7 @@ async def _run_case(
         error_message=None,
         judge_status=judgment.status,
         judge_error_message=judgment.error_message,
-        model_called=bool(recorder.responses),
+        model_called=recorder.attempted or bool(recorder.responses),
         latency=latency,
         meta=meta,
         price=generator_price,
@@ -456,6 +479,7 @@ async def _run_case(
         judge=judgment.assessment,
         judge_meta=judgment.meta,
         judge_price=judge_price,
+        judge_check=judgment.check,
     )
 
 
@@ -466,11 +490,13 @@ class _Judgment:
         assessment: JudgeAssessment | None = None,
         error_message: str | None = None,
         meta: LLMCallMeta | None = None,
+        check: JudgeCheckResult | None = None,
     ) -> None:
         self.status = status
         self.assessment = assessment
         self.error_message = error_message
         self.meta = meta
+        self.check = check
 
 
 async def _judge(
@@ -489,7 +515,21 @@ async def _judge(
         meta = recorder.metas[-1] if recorder.metas else None
         return _Judgment(JudgeRunStatus.ERROR, error_message=str(exc), meta=meta)
     meta = recorder.metas[-1] if recorder.metas else None
-    return _Judgment(JudgeRunStatus.SCORED, assessment=assessment, meta=meta)
+    checked = check_judge_assessment(assessment, card)
+    if checked.judge_error:
+        return _Judgment(
+            JudgeRunStatus.ERROR,
+            assessment=assessment,
+            error_message=checked.review_reason or "Некорректный ответ судьи",
+            meta=meta,
+            check=checked,
+        )
+    return _Judgment(
+        JudgeRunStatus.SCORED,
+        assessment=assessment,
+        meta=meta,
+        check=checked,
+    )
 
 
 def assess_draft(raw: str | None) -> DraftChecks:
@@ -518,10 +558,6 @@ def assess_draft(raw: str | None) -> DraftChecks:
     )
 
 
-def _semantic_issue(assessment: JudgeAssessment) -> bool:
-    return bool(assessment.unsupported_claims or assessment.critical_errors)
-
-
 def _scenario(
     case: GenerationDatasetCase,
     *,
@@ -540,10 +576,15 @@ def _scenario(
     judge: JudgeAssessment | None = None,
     judge_meta: LLMCallMeta | None = None,
     judge_price: ModelPrice | None = None,
+    judge_check: JudgeCheckResult | None = None,
 ) -> GenerationScenarioReport:
     usage = meta.usage if meta is not None else None
     judge_usage = judge_meta.usage if judge_meta is not None else None
-    review, reason = _review_flag(judge)
+    review = bool(judge_check.needs_manual_review) if judge_check is not None else False
+    reason = judge_check.review_reason if judge_check is not None else ""
+    confirmed = (
+        bool(judge_check.confirmed_semantic_issue) if judge_check is not None else False
+    )
     return GenerationScenarioReport(
         case_id=case.id,
         description=case.description,
@@ -562,22 +603,13 @@ def _scenario(
         raw_response=raw_response,
         judge=judge,
         judge_usage=judge_usage,
-        judge_cost=usage_cost([judge_usage], judge_price) if judge_usage is not None else None,
+        judge_cost=(
+            usage_cost([judge_usage], judge_price) if judge_usage is not None else None
+        ),
+        confirmed_semantic_issue=confirmed,
         needs_manual_review=review,
         manual_review_reason=reason,
     )
-
-
-def _review_flag(assessment: JudgeAssessment | None) -> tuple[bool, str]:
-    if assessment is None:
-        return False, ""
-    if assessment.verdict is JudgeVerdict.REVIEW:
-        return True, "Судья пометил вердикт как требующий ручной проверки."
-    if assessment.verdict is JudgeVerdict.PASS and (
-        assessment.unsupported_claims or assessment.factual_consistency_score < 3
-    ):
-        return True, "Вердикт pass расходится с фактическими замечаниями судьи."
-    return False, ""
 
 
 def _payload(raw: str | None) -> Any:
@@ -596,22 +628,3 @@ def _flag_rate(
     known = [item for item in scenarios if flag(item) is not None]
     passed = sum(bool(flag(item)) for item in known)
     return count_rate(passed, len(known))
-
-
-def _sum_costs(costs: Sequence[UsageCost | None]) -> UsageCost:
-    present = [item for item in costs if item is not None]
-    prompt_tokens = sum(item.prompt_tokens for item in present)
-    completion_tokens = sum(item.completion_tokens for item in present)
-    if not present or any(not item.priced or item.cost is None for item in present):
-        return UsageCost(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cost=None,
-            priced=False,
-        )
-    return UsageCost(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cost=sum(item.cost for item in present if item.cost is not None),
-        priced=True,
-    )

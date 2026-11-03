@@ -6,7 +6,7 @@
 
 Несколько моделей:
 
-    uv run python -m app.evals.generation_cli --models provider/a,provider/b --judge-model provider/judge
+    uv run python -m app.evals.generation_cli --models provider/a,provider/b --judge-model judge
 """
 
 import argparse

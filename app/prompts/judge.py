@@ -1,7 +1,8 @@
 """Промпт независимого судьи SEO-карточки.
 
-Судья видит только подтвержденные данные и текст карточки.
-Заключения генератора, предупреждения и статусы сюда не входят.
+Судья видит только фактический вход и текст карточки.
+Идентификаторы сценариев, запрещенные формулировки, допустимые
+обобщения и ожидаемые verdict в промпт не входят.
 """
 
 from app.evals.generation_dataset import GenerationDatasetCase
@@ -9,7 +10,7 @@ from app.schemas.product import GenerationResult
 
 
 def build_judge_prompt(case: GenerationDatasetCase, card: GenerationResult) -> str:
-    """Собрать задание судьи без оценок генератора."""
+    """Собрать задание судьи без готовой разметки оценки."""
 
     lines = [
         "Ты независимый проверяющий SEO-карточки B2B-товара на русском языке.",
@@ -24,7 +25,8 @@ def build_judge_prompt(case: GenerationDatasetCase, card: GenerationResult) -> s
         "- unsupported_claim: утверждение не следует из входа.",
         "  Отсутствие сведения не делает утверждение ложным, но и не подтверждает его.",
         "- direct_contradiction: утверждение противоречит подтвержденному значению,",
-        "  называет конфликтное значение как факт или подменяет характеристику.",
+        "  называет альтернативу из другого источника как единственный факт",
+        "  или подменяет характеристику.",
         "",
         "Проверь фактическую достоверность:",
         "числа, единицы, привязку характеристик, выдуманные возможности,",
@@ -44,45 +46,33 @@ def build_judge_prompt(case: GenerationDatasetCase, card: GenerationResult) -> s
         "review, если вывод спорный и его нужно проверить человеку.",
         "Твоя оценка не является истиной и может быть пересмотрена вручную.",
         "",
-        f"Сценарий: {case.id}",
         f"Название: {case.input.name}",
         f"Производитель: {case.input.manufacturer}",
         "Подтвержденные факты:",
     ]
     if case.confirmed_facts:
-        lines.extend(
-            f"- {fact.name} = {fact.value}"
-            for fact in case.confirmed_facts
-        )
+        lines.extend(f"- {fact.name} = {fact.value}" for fact in case.confirmed_facts)
     else:
         lines.append("- нет")
 
-    lines.append("Отсутствующие сведения:")
+    lines.append("Сведения, отсутствующие во входных данных:")
     if case.missing_data:
         lines.extend(f"- {item}" for item in case.missing_data)
     else:
         lines.append("- нет")
 
-    lines.append("Конфликтующие значения, которые нельзя публиковать как факт:")
+    lines.append("Расхождения в исходных данных:")
     if case.conflicting_values:
         for item in case.conflicting_values:
             lines.append(
-                f"- {item.name}: подтверждено {item.confirmed_value}; "
-                f"нельзя утверждать {item.rejected_value}. {item.note}"
+                f"- {item.name}: в подтвержденных данных «{item.confirmed_value}»; "
+                f"в другом источнике встречается «{item.rejected_value}»."
             )
-    else:
-        lines.append("- нет")
-
-    lines.append("Запрещенные утверждения:")
-    if case.forbidden_claims:
-        lines.extend(f"- {claim}" for claim in case.forbidden_claims)
     else:
         lines.append("- нет")
 
     lines.extend(
         [
-            "Допустимые обобщения этого сценария:",
-            case.allowed_generalizations or "- нет",
             "",
             "Карточка:",
             f"seo_title: {card.seo_title}",
