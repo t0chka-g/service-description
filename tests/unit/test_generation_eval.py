@@ -19,11 +19,28 @@ from app.evals.generation_runner import (
 )
 from app.evals.judge import ClaimKind, JudgeAssessment, JudgeVerdict
 from app.evals.judge_calibration import (
+    CalibrationRunStatus,
     ViolationClass,
     as_prompt_case,
     compare_calibration,
+    expected_claim_kind,
+    expects_semantic_issue,
+    judge_schema_hash,
     load_judge_calibration_dataset,
     run_judge_calibration,
+    run_judge_calibration_report,
+    select_calibration_cases,
+    write_calibration_report,
+)
+from app.evals.judge_calibration_cli import (
+    build_parser as build_calibration_parser,
+)
+from app.evals.judge_calibration_cli import (
+    run_cli as run_calibration_cli,
+)
+from app.evals.judge_calibration_cli import (
+    selected_case_ids,
+    selected_judge,
 )
 from app.evals.judge_checks import check_judge_assessment, quote_in_card
 from app.prompts.judge import build_judge_prompt
@@ -50,6 +67,7 @@ CALIBRATION_IDS = [
     "cal_unsupported_commercial",
     "cal_acceptable_generalization",
     "cal_spec_contradiction",
+    "cal_keyword_stuffing",
 ]
 
 
@@ -132,11 +150,12 @@ def _judge_body(
     claims: list[dict] | None = None,
     critical_errors: list[str] | None = None,
     evidence: list[dict] | None = None,
+    seo_score: int | None = None,
 ) -> str:
     return json.dumps(
         {
             "factual_consistency_score": score,
-            "seo_quality_score": score,
+            "seo_quality_score": score if seo_score is None else seo_score,
             "language_quality_score": score,
             "unsupported_claims": claims or [],
             "critical_errors": critical_errors or [],
@@ -507,15 +526,24 @@ def test_calibration_dataset_covers_required_scenarios() -> None:
         ViolationClass.UNSUPPORTED_COMMERCIAL_ADVANTAGE,
         ViolationClass.ACCEPTABLE_GENERALIZATION,
         ViolationClass.SPEC_CONTRADICTION,
+        ViolationClass.KEYWORD_STUFFING,
     }
     for case in cases:
-        prompt = build_judge_prompt(as_prompt_case(case), case.card)
+        assert case.allowed_verdicts
+        prompt_case = as_prompt_case(case)
+        assert prompt_case.id == "calibration_case"
+        assert prompt_case.forbidden_claims == []
+        assert prompt_case.allowed_generalizations == ""
+        prompt = build_judge_prompt(prompt_case, case.card)
         assert case.id not in prompt
+        assert case.description not in prompt
         assert "expected_violation_class" not in prompt
         assert "allowed_verdicts" not in prompt
         assert f"класс нарушения: {case.expected_violation_class.value}" not in prompt
+        assert f"expected_violation_class={case.expected_violation_class.value}" not in prompt
         for verdict in case.allowed_verdicts:
             assert f"ожидаемый verdict: {verdict}" not in prompt
+            assert f"ожидаемый verdict: {verdict.value}" not in prompt
 
 
 def test_calibration_compare_matches_ground_truth_offline() -> None:
@@ -547,24 +575,337 @@ def test_calibration_compare_matches_ground_truth_offline() -> None:
         )
     )
     result = compare_calibration(case, assessment)
+    assert result.expected_claim_kind is ClaimKind.DIRECT_CONTRADICTION
     assert result.verdict_match is True
+    assert result.claim_classification_match is True
     assert result.issue_presence_match is True
     assert result.matched is True
 
 
-async def test_calibration_runner_bypasses_generator() -> None:
-    cases = [
+def test_expected_claim_kind_mapping() -> None:
+    assert expected_claim_kind(ViolationClass.NONE) is None
+    assert expected_claim_kind(ViolationClass.ACCEPTABLE_GENERALIZATION) is None
+    assert expected_claim_kind(ViolationClass.KEYWORD_STUFFING) is None
+    assert expects_semantic_issue(ViolationClass.KEYWORD_STUFFING) is False
+    assert expects_semantic_issue(ViolationClass.UNIT_SUBSTITUTION) is True
+    assert (
+        expected_claim_kind(ViolationClass.UNIT_SUBSTITUTION)
+        is ClaimKind.DIRECT_CONTRADICTION
+    )
+    assert (
+        expected_claim_kind(ViolationClass.FABRICATED_CERTIFICATE)
+        is ClaimKind.UNSUPPORTED_CLAIM
+    )
+    for violation in ViolationClass:
+        expected_claim_kind(violation)
+
+
+def test_judge_prompt_separates_seo_from_verdict() -> None:
+    case = next(
         item
         for item in load_judge_calibration_dataset()
-        if item.id == "cal_fully_supported"
+        if item.id == "cal_keyword_stuffing"
+    )
+    prompt = build_judge_prompt(as_prompt_case(case), case.card)
+    assert "(×12)" in prompt
+    assert "(повторено N раз)" in prompt
+    assert "непрерывная подстрока текста карточки" in prompt
+    assert "слабое SEO этому не мешает" in prompt
+    assert "не переводят verdict в review или fail" in prompt
+    assert "замечание только про SEO или стиль" in prompt
+    assert "keyword stuffing" in prompt.casefold()
+    assert case.id not in prompt
+    assert "keyword_stuffing" not in prompt
+
+
+def test_abbreviated_repetition_quote_stays_invalid() -> None:
+    description = "Манометр ИзмерТех МП-У-01. " * 4
+    card = GenerationResult(
+        status=GenerationStatus.INSUFFICIENT_DATA,
+        seo_title="Манометр",
+        seo_description=description.strip(),
+        commercial_block="Условия не указаны.",
+    )
+    exact = "Манометр ИзмерТех МП-У-01."
+    assert quote_in_card(exact, card) is True
+    abbreviated = (
+        "Манометр ИзмерТех МП-У-01. (×12)",
+        "Манометр ИзмерТех МП-У-01. (x4)",
+        "Манометр ИзмерТех МП-У-01. (повторено 4 раз)",
+    )
+    for quote in abbreviated:
+        assert quote_in_card(quote, card) is False
+        assessment = JudgeAssessment.model_validate(
+            json.loads(
+                _judge_body(
+                    verdict="review",
+                    score=5,
+                    claims=[
+                        {
+                            "quote": quote,
+                            "explanation": "Повтор не является новым фактом.",
+                            "kind": "unsupported_claim",
+                        }
+                    ],
+                    evidence=[
+                        {
+                            "quote": quote,
+                            "kind": "unsupported_claim",
+                            "explanation": "Сокращенная ссылка на повтор.",
+                        }
+                    ],
+                )
+            )
+        )
+        checked = check_judge_assessment(assessment, card)
+        assert checked.judge_error is True
+        assert checked.confirmed_semantic_issue is False
+        assert quote in checked.fabricated_quotes
+
+    exact_claim = JudgeAssessment.model_validate(
+        json.loads(
+            _judge_body(
+                verdict="fail",
+                score=2,
+                claims=[
+                    {
+                        "quote": exact,
+                        "explanation": "Фраза не следует из входа.",
+                        "kind": "unsupported_claim",
+                    }
+                ],
+                evidence=[
+                    {
+                        "quote": exact,
+                        "kind": "unsupported_claim",
+                        "explanation": "Точная цитата сохраняется.",
+                    }
+                ],
+            )
+        )
+    )
+    exact_check = check_judge_assessment(exact_claim, card)
+    assert exact_check.judge_error is False
+    assert exact_check.fabricated_quotes == ()
+    assert exact_check.confirmed_semantic_issue is True
+
+
+def test_calibration_cards_keep_facts_without_filler() -> None:
+    filler = "Текст карточки повторяет только подтвержденные сведения"
+    verdicts = {
+        "cal_fully_supported": [JudgeVerdict.PASS],
+        "cal_unit_substitution": [JudgeVerdict.FAIL],
+        "cal_fabricated_certificate": [JudgeVerdict.FAIL, JudgeVerdict.REVIEW],
+        "cal_unsupported_purpose": [JudgeVerdict.FAIL, JudgeVerdict.REVIEW],
+        "cal_unsupported_commercial": [JudgeVerdict.FAIL, JudgeVerdict.REVIEW],
+        "cal_acceptable_generalization": [JudgeVerdict.PASS],
+        "cal_spec_contradiction": [JudgeVerdict.FAIL],
+        "cal_keyword_stuffing": [JudgeVerdict.PASS],
+    }
+    anchors = {
+        "cal_fabricated_certificate": "Изделие имеет сертификат ГОСТ Р.",
+        "cal_unsupported_purpose": "Предназначен для автоматизации пищевой промышленности.",
+        "cal_unsupported_commercial": "Лучшая цена на рынке и гарантия 5 лет.",
+        "cal_acceptable_generalization": (
+            "подходит для контроля избыточного давления в указанных пределах"
+        ),
+    }
+    cases = load_judge_calibration_dataset()
+    assert [case.id for case in cases] == list(verdicts)
+    for case in cases:
+        description = case.card.seo_description
+        assert filler not in description
+        assert "(×" not in description
+        assert "повторено" not in description
+        assert case.allowed_verdicts == verdicts[case.id]
+        for fact in case.confirmed_facts:
+            if case.id == "cal_unit_substitution" and fact.name == "диапазон измерений":
+                assert fact.value not in description
+                assert "0...1,0 bar" in description
+                continue
+            if case.id == "cal_spec_contradiction" and fact.name == "диапазон измерений":
+                assert fact.value not in description
+                assert "0...2,5 МПа" in description
+                continue
+            assert fact.value in description
+        if case.id in anchors:
+            assert anchors[case.id] in description
+
+    stuffing = cases[-1]
+    assert stuffing.card.seo_description.count("Манометр ИзмерТех МП-У-01.") >= 20
+    assert expects_semantic_issue(stuffing.expected_violation_class) is False
+
+
+def test_keyword_stuffing_does_not_excuse_a_factual_accusation() -> None:
+    case = next(
+        item
+        for item in load_judge_calibration_dataset()
+        if item.id == "cal_keyword_stuffing"
+    )
+    exact = "Манометр ИзмерТех МП-У-01."
+    evidence = [
+        {
+            "quote": exact,
+            "kind": "confirmed_fact",
+            "explanation": "Название и производитель подтверждены. Повтор снижает SEO.",
+        }
     ]
+    passed = JudgeAssessment.model_validate(
+        json.loads(
+            _judge_body(
+                verdict="pass",
+                score=5,
+                seo_score=1,
+                evidence=evidence,
+            )
+        )
+    )
+    passed_result = compare_calibration(case, passed)
+    assert passed.seo_quality_score == 1
+    assert passed_result.verdict_match is True
+    assert passed_result.claim_classification_match is True
+    assert passed_result.issue_presence_match is True
+    assert passed_result.matched is True
+    assert passed_result.judge_error is False
+
+    reviewed = JudgeAssessment.model_validate(
+        json.loads(_judge_body(verdict="review", score=5, seo_score=1, evidence=evidence))
+    )
+    reviewed_result = compare_calibration(case, reviewed)
+    assert reviewed_result.verdict_match is False
+    assert reviewed_result.judge_error is False
+    assert reviewed_result.claim_classification_match is True
+    assert reviewed_result.issue_presence_match is True
+    assert reviewed_result.matched is False
+
+    accused = JudgeAssessment.model_validate(
+        json.loads(
+            _judge_body(
+                verdict="fail",
+                score=2,
+                seo_score=1,
+                claims=[
+                    {
+                        "quote": exact,
+                        "explanation": "Повтор объявлен неподтвержденным фактом.",
+                        "kind": "unsupported_claim",
+                    }
+                ],
+                evidence=[
+                    {
+                        "quote": exact,
+                        "kind": "unsupported_claim",
+                        "explanation": "Ложное фактическое обвинение.",
+                    }
+                ],
+            )
+        )
+    )
+    accused_result = compare_calibration(case, accused)
+    assert accused_result.judge_error is False
+    assert accused_result.claim_classification_match is False
+    assert accused_result.verdict_match is False
+
+    abbreviated = f"{exact} (×28)"
+    assert quote_in_card(abbreviated, case.card) is False
+    broken = JudgeAssessment.model_validate(
+        json.loads(
+            _judge_body(
+                verdict="pass",
+                score=5,
+                seo_score=1,
+                evidence=[
+                    {
+                        "quote": abbreviated,
+                        "kind": "confirmed_fact",
+                        "explanation": "Сокращенный повтор.",
+                    }
+                ],
+            )
+        )
+    )
+    broken_result = compare_calibration(case, broken)
+    assert broken_result.judge_error is True
+    assert broken_result.claim_classification_match is None
+    assert broken_result.matched is False
+
+
+async def test_calibration_runner_bypasses_generator(tmp_path: Path) -> None:
+    cases = select_calibration_cases(
+        load_judge_calibration_dataset(),
+        ["cal_fully_supported"],
+    )
+    judge = ScriptedClient(
+        _judge_body(verdict="pass", score=5),
+        usage=LLMUsage(prompt_tokens=10, completion_tokens=5),
+    )
+    report = await run_judge_calibration_report(
+        cases,
+        judge,
+        model="judge/test",
+        temperature=0.0,
+        prices={"judge/test": ModelPrice(prompt_per_million=1.0, completion_per_million=2.0)},
+        report_dir=tmp_path,
+        created_at=datetime(2026, 11, 4, tzinfo=UTC),
+    )
+    assert report.scenario_count == 1
+    assert report.scenarios[0].status is CalibrationRunStatus.SCORED
+    assert report.scenarios[0].matched is True
+    assert report.rates.verdict_accuracy.value == 1.0
+    assert report.rates.claim_classification_accuracy.value == 1.0
+    assert report.rates.false_positive_rate.value == 0.0
+    assert report.rates.false_negative_rate.value is None
+    assert report.rates.api_error_rate.value == 0.0
+    assert report.prompt_hash
+    assert report.schema_hash == judge_schema_hash()
+    assert len(judge.calls) == 1
+    assert "Запрещенные утверждения" not in judge.calls[0]
+    assert cases[0].expected_violation_class.value not in judge.calls[0].split("Карточка:")[0]
+    path = write_calibration_report(report, tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["model"] == "judge/test"
+    assert "rates" in payload
+    assert payload["score_means_note"]
+
+
+async def test_calibration_runner_compat_wrapper() -> None:
+    cases = select_calibration_cases(
+        load_judge_calibration_dataset(),
+        ["cal_fully_supported"],
+    )
     judge = ScriptedClient(_judge_body(verdict="pass", score=5))
     result = await run_judge_calibration(cases, judge)
     assert result.case_count == 1
     assert result.matched_count == 1
-    assert len(judge.calls) == 1
-    assert "Запрещенные утверждения" not in judge.calls[0]
-    assert cases[0].expected_violation_class.value not in judge.calls[0].split("Карточка:")[0]
+
+
+async def test_calibration_separates_api_error_from_classification() -> None:
+    cases = select_calibration_cases(
+        load_judge_calibration_dataset(),
+        ["cal_unit_substitution"],
+    )
+    judge = ScriptedClient(error=LLMError("network", kind=LLMErrorKind.API))
+    report = await run_judge_calibration_report(
+        cases,
+        judge,
+        model="judge/test",
+        created_at=datetime(2026, 11, 4, tzinfo=UTC),
+    )
+    assert report.scenarios[0].status is CalibrationRunStatus.API_ERROR
+    assert report.rates.api_error_rate.value == 1.0
+    assert report.rates.verdict_accuracy.value is None
+    assert report.rates.claim_classification_accuracy.value is None
+    assert report.api_errors == ["cal_unit_substitution"]
+
+
+async def test_calibration_cli_refuses_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.evals.judge_calibration_cli.settings.openai_api_key", "")
+    args = build_calibration_parser().parse_args(
+        ["--judge-model", "provider/judge", "--case", "cal_unit_substitution"]
+    )
+    assert selected_judge(args) == "provider/judge"
+    assert selected_case_ids(args) == ["cal_unit_substitution"]
+    assert await run_calibration_cli(args) == 2
 
 
 async def test_report_roundtrip(tmp_path: Path) -> None:
