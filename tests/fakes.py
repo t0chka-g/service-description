@@ -14,7 +14,8 @@ class FakeLLMClient:
             self._response = response
         self.calls: list[str] = []
 
-    async def complete(self, prompt: str) -> str:
+    async def complete(self, prompt: str, *, response_model: object = None) -> str:
+        del response_model
         self.calls.append(prompt)
         return self._response
 
@@ -26,6 +27,7 @@ class RaisingLLMClient:
         self._error = error
         self.calls: list[str] = []
 
-    async def complete(self, prompt: str) -> str:
+    async def complete(self, prompt: str, *, response_model: object = None) -> str:
+        del response_model
         self.calls.append(prompt)
         raise self._error

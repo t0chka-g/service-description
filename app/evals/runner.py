@@ -143,8 +143,11 @@ class _RecordingLLMClient:
         self._inner = inner
         self.responses: list[str] = []
 
-    async def complete(self, prompt: str) -> str:
-        response = await self._inner.complete(prompt)
+    async def complete(self, prompt: str, *, response_model: object = None) -> str:
+        if response_model is None:
+            response = await self._inner.complete(prompt)
+        else:
+            response = await self._inner.complete(prompt, response_model=response_model)
         self.responses.append(response)
         return response
 

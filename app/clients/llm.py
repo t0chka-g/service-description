@@ -1,11 +1,14 @@
 """Клиент OpenAI API с возможностью подмены в тестах."""
 
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from openai import AsyncOpenAI, OpenAIError
+from pydantic import BaseModel, ConfigDict
 
 from app.schemas.product import DescriptionExtraction
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
@@ -25,11 +28,35 @@ class LLMError(Exception):
         self.kind = kind
 
 
+class LLMUsage(BaseModel):
+    """Фактический usage ответа. Стоимость по нему считает evaluation, не клиент."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int | None = None
+
+
+class LLMCallMeta(BaseModel):
+    """Метаданные последнего вызова. Появляются только если провайдер их вернул."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    response_model: str | None = None
+    usage: LLMUsage | None = None
+
+
 class LLMClient(Protocol):
     """Минимальный контракт LLM-клиента для dependency injection."""
 
-    async def complete(self, prompt: str) -> str:
-        """Вернуть текстовый ответ модели на промпт."""
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        response_model: type[ModelT] | None = None,
+    ) -> str:
+        """Вернуть JSON-ответ модели. Без схемы сохраняется извлечение характеристик."""
         ...
 
 
@@ -43,6 +70,7 @@ class OpenAILLMClient:
         model: str,
         base_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        temperature: float | None = None,
     ) -> None:
         if not api_key.strip():
             raise LLMError("OPENAI_API_KEY is empty", kind=LLMErrorKind.API)
@@ -50,23 +78,35 @@ class OpenAILLMClient:
             raise LLMError("OPENAI_MODEL is empty", kind=LLMErrorKind.API)
         self._model = model
         self._timeout = timeout
+        self._temperature = temperature
+        self.last_call: LLMCallMeta | None = None
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url or None,
             timeout=timeout,
         )
 
-    async def complete(self, prompt: str) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        response_model: type[ModelT] | None = None,
+    ) -> str:
+        schema: type[BaseModel] = response_model or DescriptionExtraction
+        request: dict[str, object] = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": schema,
+            "timeout": self._timeout,
+        }
+        if self._temperature is not None:
+            request["temperature"] = self._temperature
         try:
-            completion = await self._client.chat.completions.parse(
-                model=self._model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format=DescriptionExtraction,
-                timeout=self._timeout,
-            )
+            completion = await self._client.chat.completions.parse(**request)
         except OpenAIError as exc:
             raise LLMError("OpenAI request failed", kind=LLMErrorKind.API) from exc
 
+        self.last_call = _call_meta(completion)
         if not completion.choices:
             raise LLMError("structured response is empty")
         choice = completion.choices[0].message
@@ -75,3 +115,23 @@ class OpenAILLMClient:
         if choice.parsed is None:
             raise LLMError("structured response is empty")
         return choice.parsed.model_dump_json()
+
+
+def _call_meta(completion: object) -> LLMCallMeta:
+    usage = getattr(completion, "usage", None)
+    parsed_usage: LLMUsage | None = None
+    if usage is not None:
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+            total = getattr(usage, "total_tokens", None)
+            parsed_usage = LLMUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total if isinstance(total, int) else None,
+            )
+    response_model = getattr(completion, "model", None)
+    return LLMCallMeta(
+        response_model=response_model if isinstance(response_model, str) else None,
+        usage=parsed_usage,
+    )
