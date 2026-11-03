@@ -17,3 +17,15 @@ class FakeLLMClient:
     async def complete(self, prompt: str) -> str:
         self.calls.append(prompt)
         return self._response
+
+
+class RaisingLLMClient:
+    """Поднимает заданную ошибку вместо ответа модели."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.calls: list[str] = []
+
+    async def complete(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        raise self._error

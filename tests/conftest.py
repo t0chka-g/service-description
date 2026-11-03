@@ -35,6 +35,20 @@ def extraction_cases_by_id(extraction_cases: list[dict[str, Any]]) -> dict[str, 
     return {case["id"]: case for case in extraction_cases}
 
 
+@pytest.fixture(scope="session")
+def generation_cases() -> list[dict[str, Any]]:
+    """Загрузить сценарии SEO-генерации без эталонного текста."""
+    path = FIXTURES_DIR / "generation_cases.json"
+    with path.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+@pytest.fixture(scope="session")
+def generation_cases_by_id(generation_cases: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Индекс сценариев генерации по id."""
+    return {case["id"]: case for case in generation_cases}
+
+
 @pytest.fixture
 def fake_llm_factory():
     """Фабрика Fake LLM с ответом из сценария или явным payload."""
