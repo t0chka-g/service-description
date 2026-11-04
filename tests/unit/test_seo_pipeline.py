@@ -204,7 +204,7 @@ async def test_short_description_is_repaired_once() -> None:
     assert "search_queries" not in repair_prompt
 
 
-# 5. Неуспешный repair → needs_review.
+# 5. Неуспешный repair -> needs_review.
 
 
 @pytest.mark.parametrize(

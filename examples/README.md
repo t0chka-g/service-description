@@ -7,7 +7,7 @@
 | `manometer.json` | Манометр, сценарий полной карточки (smoke / E2E) |
 | `manometer.request.json` | Тот же сценарий манометра (alias для docs) |
 | `temperature_sensor.json` | Другой измерительный прибор |
-| `thermometer_insufficient.json` | Мало данных → `insufficient_data` |
+| `thermometer_insufficient.json` | Мало данных -> `insufficient_data` |
 | `thermometer.request.json` | Короткий сценарий термометра |
 
 Часть примеров совпадает с OpenAPI (`app/api/examples.py`).

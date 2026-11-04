@@ -30,22 +30,56 @@ AI-сервис на FastAPI для генерации SEO-карточек то
 
 ## Архитектура
 
-Кратко: **Web UI → FastAPI → Extractor → Validator → SEO Generator → Response**; LLM вызывается отдельно для извлечения и (при открытом шлюзе) для генерации текста.
+Запрос идет по цепочке **Web UI -> FastAPI -> Characteristic Extractor -> SEO Generator -> GenerationResult**. OpenRouter вызывается из Extractor, если есть текст описания, и из Generator, только когда шлюз полноты открыт. LLM Judge в этот путь не входит: это офлайн оценка в `app/evals/`.
 
-Подробные Mermaid-диаграммы (компоненты, sequence, ошибки): [`docs/architecture.md`](docs/architecture.md).
+Слои и обработка ошибок также описаны в [`docs/architecture.md`](docs/architecture.md).
 
 ```mermaid
 flowchart LR
-  UI["Web UI"] --> API["FastAPI"]
-  API --> EXT["Extractor"]
-  EXT --> VAL["Validator"]
-  EXT --> GEN["SEO Generator"]
-  GEN --> OUT["GenerationResult"]
-  EXT -.-> LLM["OpenRouter LLM API"]
-  GEN -.-> LLM
+  subgraph clients [Клиент]
+    UI["Web UI"]
+    DOCS["Swagger / ReDoc"]
+  end
+
+  subgraph http [HTTP]
+    API["FastAPI"]
+    IN["ProductInput"]
+  end
+
+  subgraph pipeline [Конвейер]
+    EXT["Characteristic Extractor"]
+    GR["Grounding / Validation"]
+    GEN["SEO Generator"]
+  end
+
+  subgraph external [Внешний сервис]
+    LLM["OpenRouter API"]
+  end
+
+  subgraph result [Ответ]
+    OUT["GenerationResult"]
+  end
+
+  subgraph offline [Вне запроса]
+    JUDGE["LLM Judge"]
+  end
+
+  UI -->|"POST /api/v1/products/generate"| API
+  DOCS -->|"тот же маршрут"| API
+  API --> IN
+  IN --> EXT
+  EXT --> GR
+  GR --> GEN
+  GEN --> OUT
+  OUT --> UI
+  EXT -.->|"извлечение из description"| LLM
+  GEN -.->|"SEO текст, если шлюз открыт"| LLM
+  JUDGE -.->|"офлайн оценка, не шаг генерации"| GEN
 ```
 
-## Порядок обработки запроса
+Подтвержденные характеристики собирает Extractor. Generator не перечитывает исходное описание и не подменяет `specifications` текстом модели.
+
+## Как работает генерация
 
 1. Клиент отправляет `ProductInput` на `POST /api/v1/products/generate`.
 2. FastAPI валидирует тело (при ошибке — **422**).
@@ -53,9 +87,75 @@ flowchart LR
 4. **Extractor** берет значения из `specs` дословно; при непустом `description` вызывает LLM и принимает только пары с подтверждающей цитатой (`validators.supported_quote`).
 5. Конфликты specs↔description фиксируются; значение из specs не подменяется.
 6. **SEO Generator** оценивает достаточность данных (имя + не меньше трех подтвержденных значений):
-   - данных мало → **200** с `insufficient_data`, без вызова LLM;
-   - данных достаточно → запрос к LLM на SEO-текст, проверка фактов и сборка `GenerationResult`.
-7. Сбои провайдера/контракта модели мапятся на **502 / 503 / 504** (см. раздел API и `docs/architecture.md`). Непрошедший текст при открытом шлюзе дает **200** `needs_review`, а не обязательно 502.
+   - данных мало -> **200** с `insufficient_data`, без вызова LLM;
+   - данных достаточно -> запрос к LLM на SEO текст, проверка фактов и сборка `GenerationResult`.
+7. Сбои провайдера на обязательном вызове мапятся на **502 / 503 / 504**. Непрошедший текст и неразобранный JSON генерации дают **200** `needs_review`. Неразборчивый JSON извлечения по-прежнему **502**.
+
+Жизненный цикл одного запроса. Второй вызов модели бывает только как точечный repair описания и только если первая проверка не упала на неподтвержденном числе или единице (`ungrounded`). Ошибка repair не превращается в ошибку HTTP: остается исходный отказ описания.
+
+```mermaid
+sequenceDiagram
+  actor User as Пользователь
+  participant UI as Web UI
+  participant API as FastAPI
+  participant Ext as Extractor
+  participant Gen as SEO Generator
+  participant LLM as OpenRouter API
+
+  User->>UI: Заполняет форму
+  UI->>API: POST /api/v1/products/generate
+  alt Тело не проходит ProductInput
+    API-->>UI: 422
+    UI-->>User: Ошибка полей
+  else Схема принята
+    API->>API: Нормализация полей и ключей specs
+    API->>Ext: extract
+    Ext->>Ext: Значения specs дословно
+    alt description пустое или нет ключей specs
+      Ext-->>API: ExtractionResult без вызова LLM
+      API->>Gen: generate
+    else Есть текст и ключи
+      Ext->>LLM: Промпт извлечения
+      alt Таймаут, сбой API или JSON не разобран
+        API-->>UI: 504, 503 или 502
+        UI-->>User: Сообщение об ошибке
+      else Кандидаты разобраны
+        Ext->>Ext: Цитата, конфликт, missing_fields
+        Ext-->>API: ExtractionResult
+        API->>Gen: generate
+      end
+    end
+    alt Generator не вызывался
+      Note over API,UI: Ответ уже отдан как ошибка HTTP
+    else Нет имени или меньше 3 значений
+      Gen-->>API: 200 insufficient_data
+    else Шлюз открыт
+      Gen->>LLM: Промпт SEO карточки
+      alt Таймаут или сбой провайдера
+        API-->>UI: 504 или 503
+      else Сбой контракта вызова
+        API-->>UI: 502
+      else JSON черновика не разобран
+        Gen-->>API: 200 needs_review, без второго вызова
+      else Черновик разобран
+        Gen->>Gen: Описание, заголовок, запросы, коммерческий блок
+        opt Отказ описания не из-за ungrounded
+          Gen->>LLM: Один repair описания
+          Note over Gen: Сбой repair остается needs_review
+        end
+        alt Текст и запросы приняты
+          Gen-->>API: 200 complete
+        else Описание или запросы не прошли
+          Gen-->>API: 200 needs_review
+        end
+      end
+    end
+    opt Есть GenerationResult
+      API-->>UI: JSON карточки
+      UI-->>User: Карточка или частичный результат
+    end
+  end
+```
 
 ## Как строится SEO-карточка
 
@@ -74,6 +174,34 @@ flowchart LR
 | `complete` | Заголовок до 70 знаков, описание 800–1200, 3–5 запросов, коммерческий блок |
 | `needs_review` | Часть полей не прошла проверку, подтвержденные характеристики сохранены |
 | `insufficient_data` | Подтвержденных данных мало, модель не вызывалась |
+
+## Статусы и обработка ошибок
+
+Три значения `GenerationStatus` возвращаются с HTTP **200**. Коды **422 / 502 / 503 / 504** — это отказ запроса, а не статус карточки. Нехватка входа, отказ текста и сбой провайдера не смешиваются.
+
+```mermaid
+flowchart TD
+  REQ["POST generate"] --> SCHEMA{"ProductInput валиден?"}
+  SCHEMA -->|нет| E422["HTTP 422"]
+  SCHEMA -->|да| EXT["Extractor"]
+  EXT --> EXTERR{"Ошибка LLM извлечения?"}
+  EXTERR -->|"таймаут"| E504["HTTP 504"]
+  EXTERR -->|"провайдер недоступен"| E503["HTTP 503"]
+  EXTERR -->|"JSON не разобран"| E502["HTTP 502"]
+  EXTERR -->|нет| GATE{"Имя и не меньше 3 значений?"}
+  GATE -->|нет| LOW["200 insufficient_data<br/>LLM генерации не вызывалась"]
+  GATE -->|да| DRAFT["Запрос SEO черновика"]
+  DRAFT --> GENERR{"Ошибка первого вызова?"}
+  GENERR -->|"таймаут"| E504
+  GENERR -->|"провайдер недоступен"| E503
+  GENERR -->|"сбой контракта вызова"| E502
+  GENERR -->|"JSON черновика не разобран"| REVIEW["200 needs_review"]
+  GENERR -->|черновик есть| CHECK{"Описание и запросы приняты?"}
+  CHECK -->|да| OK["200 complete"]
+  CHECK -->|нет| REVIEW
+```
+
+`insufficient_data` ставится до вызова модели генерации. `needs_review` ставится, когда данных хватает, но описание не опубликовано или поисковых запросов меньше трех; характеристики при этом сохраняются. Заголовок и коммерческий блок при локальном отказе заменяются строкой из подтвержденных данных и сами по себе статус не переводят. Сбой repair описания остается внутри `needs_review` и не становится 502.
 
 ## Установка через uv
 
@@ -98,7 +226,7 @@ cp .env.example .env
 
 ## Настройка .env
 
-Скопируйте `.env.example` → `.env` и задайте значения. Файл `.env` **не** попадает в Docker-образ.
+Скопируйте `.env.example` -> `.env` и задайте значения. Файл `.env` **не** попадает в Docker-образ.
 
 | Переменная | Назначение | Рекомендация |
 |------------|------------|--------------|
@@ -174,7 +302,7 @@ docker compose down
 | Метод | Путь | Описание |
 |-------|------|----------|
 | `GET` | `/` | Веб-UI генерации карточки |
-| `GET` | `/health` | Проверка работоспособности → `{"status":"ok"}` |
+| `GET` | `/health` | Проверка работоспособности -> `{"status":"ok"}` |
 | `GET` | `/docs` | Swagger UI |
 | `GET` | `/redoc` | ReDoc |
 | `POST` | `/api/v1/products/generate` | Генерация SEO-карточки |
@@ -208,7 +336,7 @@ docker compose down
 |------|------------|
 | `manometer.json` / `manometer.request.json` | Манометр, сценарий полной карточки |
 | `temperature_sensor.json` | Другой измерительный прибор |
-| `thermometer_insufficient.json` / `thermometer.request.json` | Мало данных → `insufficient_data` |
+| `thermometer_insufficient.json` / `thermometer.request.json` | Мало данных -> `insufficient_data` |
 
 Манометр (учебный пример, не паспорт прибора):
 
@@ -299,6 +427,37 @@ uv run pytest -m llm -v
 
 ## Подход к защите от галлюцинаций
 
+Источник подтвержденного значения — `specs` и цитата внутри `description`, а не свободный текст модели. Проверки отсекают часть выдуманных чисел, единиц и служебных фраз. Они не доказывают, что смысл абзаца верен: соседняя цитата, перефраз и неявное обещание остаются зоной ручной модерации и офлайн оценки LLM Judge.
+
+```mermaid
+flowchart TD
+  SPECS["specs: значение дословно"] --> CONFIRMED["Подтвержденные характеристики"]
+  DESC["description"] --> CALL{"Текст и ключи specs есть?"}
+  CALL -->|нет| MISS["Поле в missing_fields"]
+  CALL -->|да| LLM["Ответ модели: имя, значение, цитата"]
+  LLM --> QUOTE{"Цитата внутри текста и содержит значение?"}
+  QUOTE -->|нет| DROP["Кандидат отброшен"]
+  QUOTE -->|да| SAME{"Уже есть значение в specs?"}
+  SAME -->|да и строка отличается| CONFLICT["conflicts, specs не подменяется"]
+  SAME -->|да и строка та же| SKIP["Дубликат не добавляется"]
+  SAME -->|в specs пусто| CONFIRMED
+  CONFLICT --> CONFIRMED
+  SPECS --> CONFIRMED
+  CONFIRMED --> GEN["SEO текст только из этих пар"]
+  GEN --> FACTS{"Числа, единицы, привязка к параметру"}
+  FACTS -->|нарушение| BLOCK["seo_description = null, needs_review<br/>repair не вызывается"]
+  FACTS -->|числа прошли| SOFT{"Длина, повторы, служебный текст, обещание"}
+  SOFT -->|нарушение| REPAIR["Один repair описания"]
+  REPAIR --> AGAIN{"Повторная проверка"}
+  AGAIN -->|не прошло| WARN["warning, поле null, HTTP 200"]
+  AGAIN -->|прошло| PUB["Поле можно публиковать"]
+  SOFT -->|прошло| PUB
+  CONFLICT --> WONLY["warning conflict, статус может остаться complete"]
+  MISS --> WONLY2["warning missing_field"]
+```
+
+Конфликт и пропуск поля — предупреждения: карточка может быть `complete`, если текст и запросы прошли. Отказ описания или нехватка запросов блокирует публикацию этих полей и дает `needs_review`, но не ошибку HTTP. Совпадение подстроки в `supported_quote` и разбор чисел в grounding не заменяют семантическую проверку.
+
 1. Значения из `specs` копируются дословно и не «улучшаются» моделью.
 2. Из `description` принимаются только характеристики, чьи имена есть среди ключей `specs`, и только с evidence-цитатой, содержащей значение и лежащей внутри текста.
 3. При расхождении specs и description фиксируется `conflicts`; specs не заменяется.
@@ -311,7 +470,7 @@ uv run pytest -m llm -v
 
 ## Ограничения решения
 
-- Нет БД, очередей, Redis, Celery — синхронный запрос → ответ.
+- Нет БД, очередей, Redis, Celery — синхронный запрос -> ответ.
 - Зависимость от внешнего LLM-провайдера (доступность, стоимость, латентность).
 - Качество карточки ограничено полнотой и согласованностью входных `specs`/`description`.
 - Порог «полноты» для вызова генерации — эвристика (имя + ≥ 3 подтвержденных значения), а не гарантия маркетинговой достаточности текста.
@@ -350,4 +509,4 @@ docker-compose.yml
 
 ## Версионирование
 
-Версия берется из `pyproject.toml` (`importlib.metadata`). При push в `main` GitHub Actions (`python-semantic-release`) бампит ее по conventional commits (`fix`/`perf` → patch, `feat` → minor, `BREAKING CHANGE` → major).
+Версия берется из `pyproject.toml` (`importlib.metadata`). При push в `main` GitHub Actions (`python-semantic-release`) бампит ее по conventional commits (`fix`/`perf` -> patch, `feat` -> minor, `BREAKING CHANGE` -> major).
