@@ -11,7 +11,12 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_extractor, get_generator
 from app.api.errors import TIMEOUT_DETAIL, ApiError, llm_http_exception
-from app.api.examples import COMPLETE_EXAMPLE, INSUFFICIENT_EXAMPLE, REQUEST_EXAMPLES
+from app.api.examples import (
+    COMPLETE_EXAMPLE,
+    INSUFFICIENT_EXAMPLE,
+    NEEDS_REVIEW_EXAMPLE,
+    REQUEST_EXAMPLES,
+)
 from app.clients.llm import LLMError
 from app.schemas.product import GenerationInput, GenerationResult, ProductInput
 from app.services.extractor import CharacteristicExtractor
@@ -55,8 +60,9 @@ def index() -> FileResponse:
     responses={
         200: {
             "description": (
-                "Карточка собрана. Статус insufficient_data тоже возвращается здесь: "
-                "это частичный результат, а не ошибка запроса."
+                "Карточка собрана. Статусы needs_review и insufficient_data тоже "
+                "возвращаются здесь: это частичный результат, а не ошибка запроса. "
+                "У частичного результата seo_description равен null, причина лежит в warnings."
             ),
             "content": {
                 "application/json": {
@@ -68,6 +74,14 @@ def index() -> FileResponse:
                                 "Синтетический пример. Не характеристики реального прибора."
                             ),
                             "value": COMPLETE_EXAMPLE,
+                        },
+                        "needs_review": {
+                            "summary": "Частичный результат: описание не прошло проверку",
+                            "description": (
+                                "seo_description равен null. Причина указана в warnings, "
+                                "характеристики сохранены."
+                            ),
+                            "value": NEEDS_REVIEW_EXAMPLE,
                         },
                         "insufficient_data": {
                             "summary": "Демонстрационный термометр, данных мало",
@@ -102,7 +116,7 @@ async def generate_product(
     затем генерация текста. Имена для извлечения берутся из ключей specs.
 
     Ответы:
-    - 200 — карточка или частичный результат insufficient_data;
+    - 200 — карточка (complete) или частичный результат (needs_review, insufficient_data);
     - 422 — тело запроса не соответствует схеме;
     - 502 — ответ модели не удалось принять;
     - 503 — провайдер модели недоступен;

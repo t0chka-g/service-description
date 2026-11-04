@@ -94,7 +94,11 @@ COMPLETE_MIN_ATTRIBUTES = 3
 
 
 class GenerationStatus(StrEnum):
-    """Полная карточка, нехватка входных данных или частичный результат без текста модели."""
+    """Полная карточка, нехватка входных данных или частичный результат.
+
+    Статус относится ко всей карточке. Причины неполной генерации лежат
+    отдельно, в warnings, и никогда не попадают в публикуемые поля.
+    """
 
     COMPLETE = "complete"
     INSUFFICIENT_DATA = "insufficient_data"
@@ -108,6 +112,11 @@ class GenerationWarningCode(StrEnum):
     MISSING_FIELD = "missing_field"
     INSUFFICIENT_DATA = "insufficient_data"
     NEEDS_REVIEW = "needs_review"
+    GENERATION_FAILED = "generation_failed"
+    DESCRIPTION_TOO_SHORT = "description_too_short"
+    DESCRIPTION_TOO_LONG = "description_too_long"
+    DESCRIPTION_REJECTED = "description_rejected"
+    SEARCH_QUERIES_INSUFFICIENT = "search_queries_insufficient"
 
 
 class GenerationWarning(BaseModel):
@@ -185,23 +194,31 @@ def _validate_search_queries(status: GenerationStatus, queries: list[str]) -> No
 
 
 class GenerationResult(BaseModel):
-    """Черновик SEO-карточки. Характеристики копируются из GenerationInput."""
+    """SEO-карточка. Характеристики копируются из GenerationInput.
+
+    Публикуемые поля (seo_title, seo_description, specifications, search_queries,
+    commercial_block) отделены от диагностики (status, warnings, missing_fields).
+    Если готового текста нет, поле равно null, а причина лежит в warnings.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     status: GenerationStatus = Field(
         description=(
-            "complete — полная карточка. "
-            "insufficient_data — данных мало, текст частичный и не является готовым описанием. "
-            "needs_review — данные есть, но текст модели нельзя опубликовать целиком."
+            "complete — полная карточка, все обязательные поля прошли проверку. "
+            "needs_review — данных достаточно, но часть публикуемых полей не прошла проверку "
+            "и оставлена пустой; причина в warnings. "
+            "insufficient_data — подтвержденных данных мало, модель не вызывалась."
         )
     )
     seo_title: str = Field(description="SEO-заголовок не длиннее 70 символов.")
-    seo_description: str = Field(
+    seo_description: str | None = Field(
+        default=None,
         description=(
             "SEO-описание. У полной карточки от 800 до 1200 символов. "
-            "При нехватке данных текст короче 800 символов."
-        )
+            "null, если готового описания нет: служебный текст сюда не подставляется, "
+            "причина указана в warnings."
+        ),
     )
     specifications: list[ExtractedAttribute] = Field(
         default_factory=list,
@@ -209,16 +226,28 @@ class GenerationResult(BaseModel):
     )
     search_queries: list[str] = Field(
         default_factory=list,
-        description="Поисковые запросы. При нехватке данных список может быть пустым.",
+        description=(
+            "Поисковые запросы. У полной карточки от 3 до 5. "
+            "Если часть запросов не прошла проверку, список короче."
+        ),
     )
-    commercial_block: str = Field(description="Коммерческий блок по подтвержденным данным.")
+    commercial_block: str | None = Field(
+        default=None,
+        description=(
+            "Коммерческий блок по подтвержденным данным без цен, сроков и гарантий. "
+            "null, если блока нет."
+        ),
+    )
     missing_fields: list[str] = Field(
         default_factory=list,
         description="Имена характеристик, которые не удалось подтвердить.",
     )
     warnings: list[GenerationWarning] = Field(
         default_factory=list,
-        description="Предупреждения о конфликтах, пропусках и нехватке данных.",
+        description=(
+            "Служебная диагностика: конфликты, пропуски и конкретные причины "
+            "неполной генерации. Не предназначена для публикации."
+        ),
     )
 
     @model_validator(mode="after")
@@ -228,8 +257,22 @@ class GenerationResult(BaseModel):
         if len(self.seo_title) > SEO_TITLE_MAX_LENGTH:
             raise ValueError(f"seo_title exceeds {SEO_TITLE_MAX_LENGTH} characters")
 
-        if not self.seo_description.strip():
+        if self.seo_description is not None and not self.seo_description.strip():
             raise ValueError("seo_description is empty")
+        if self.commercial_block is not None and not self.commercial_block.strip():
+            raise ValueError("commercial_block is empty")
+
+        self._enforce_description_length()
+        _validate_search_queries(self.status, self.search_queries)
+        if self.status is GenerationStatus.COMPLETE and self.commercial_block is None:
+            raise ValueError("commercial_block is required for a complete card")
+        return self
+
+    def _enforce_description_length(self) -> None:
+        if self.status is GenerationStatus.COMPLETE and self.seo_description is None:
+            raise ValueError("seo_description is required for a complete card")
+        if self.seo_description is None:
+            return
         description_length = len(self.seo_description)
         if self.status is GenerationStatus.COMPLETE:
             fits_complete_length = (
@@ -254,8 +297,3 @@ class GenerationResult(BaseModel):
                 )
         else:
             assert_never(self.status)
-
-        _validate_search_queries(self.status, self.search_queries)
-        if not self.commercial_block.strip():
-            raise ValueError("commercial_block is empty")
-        return self

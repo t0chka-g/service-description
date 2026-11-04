@@ -33,7 +33,10 @@ class LazyOpenAILLMClient:
                 api_key=self._settings.openai_api_key,
                 model=self._settings.openai_model,
                 base_url=self._settings.openai_base_url,
+                timeout=self._settings.openai_timeout_seconds,
+                temperature=self._settings.openai_temperature,
                 max_completion_tokens=self._settings.openai_max_completion_tokens,
+                reasoning_effort=self._settings.openai_reasoning_effort,
             )
         return await self._client.complete(prompt, response_model=response_model)
 

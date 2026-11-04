@@ -27,8 +27,8 @@ def card_corpus(card: GenerationResult) -> str:
 
     parts = [
         card.seo_title,
-        card.seo_description,
-        card.commercial_block,
+        card.seo_description or "",
+        card.commercial_block or "",
         *card.search_queries,
     ]
     return "\n".join(parts)

@@ -20,6 +20,30 @@ class FakeLLMClient:
         return self._response
 
 
+class ScriptedLLMClient:
+    """Ответы по очереди для многошагового сценария: генерация, затем исправление.
+
+    Лишний вызов модели — ошибка теста, а не молчаливый повтор последнего ответа.
+    """
+
+    def __init__(self, steps: list[str | dict[str, Any] | Exception]) -> None:
+        self._steps = list(steps)
+        self.calls: list[str] = []
+        self.response_models: list[object] = []
+
+    async def complete(self, prompt: str, *, response_model: object = None) -> str:
+        self.calls.append(prompt)
+        self.response_models.append(response_model)
+        if not self._steps:
+            raise AssertionError(f"unexpected LLM call #{len(self.calls)}")
+        step = self._steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        if isinstance(step, dict):
+            return json.dumps(step, ensure_ascii=False)
+        return step
+
+
 class RaisingLLMClient:
     """Поднимает заданную ошибку вместо ответа модели."""
 

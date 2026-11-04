@@ -10,7 +10,8 @@ from app.schemas.product import DescriptionExtraction
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
-DEFAULT_TIMEOUT_SECONDS = 30.0
+# Запас для reasoning-моделей: ответ со скрытым рассуждением идет дольше обычного.
+DEFAULT_TIMEOUT_SECONDS = 90.0
 
 
 class LLMErrorKind(StrEnum):
@@ -72,6 +73,7 @@ class OpenAILLMClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         temperature: float | None = None,
         max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         if not api_key.strip():
             raise LLMError("OPENAI_API_KEY is empty", kind=LLMErrorKind.API)
@@ -81,6 +83,8 @@ class OpenAILLMClient:
         self._timeout = timeout
         self._temperature = temperature
         self._max_completion_tokens = max_completion_tokens
+        self._reasoning_effort = (reasoning_effort or "").strip() or None
+        self._openrouter = "openrouter.ai" in (base_url or "")
         self.last_call: LLMCallMeta | None = None
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -105,6 +109,11 @@ class OpenAILLMClient:
             request["temperature"] = self._temperature
         if self._max_completion_tokens is not None:
             request["max_completion_tokens"] = self._max_completion_tokens
+        if self._reasoning_effort is not None:
+            if self._openrouter:
+                request["extra_body"] = {"reasoning": {"effort": self._reasoning_effort}}
+            else:
+                request["reasoning_effort"] = self._reasoning_effort
         try:
             completion = await self._client.chat.completions.parse(**request)
         except OpenAIError as exc:

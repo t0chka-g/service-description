@@ -55,6 +55,67 @@ curl http://127.0.0.1:8000/health
 
 Ожидаемый ответ: `{"status":"ok"}`.
 
+## Настройка модели
+
+| Переменная | Назначение | Рекомендация |
+| --- | --- | --- |
+| `OPENAI_MODEL`, `OPENAI_BASE_URL` | Модель и endpoint (OpenRouter) | `openai/gpt-4.1-mini` и `https://openrouter.ai/api/v1` |
+| `OPENAI_TIMEOUT_SECONDS` | Таймаут одного запроса | 90 по умолчанию |
+| `OPENAI_MAX_COMPLETION_TOKENS` | Лимит токенов ответа | 3000-4096, слишком малый лимит обрезает JSON |
+| `OPENAI_REASONING_EFFORT` | Усилие рассуждения reasoning-модели | `low` для скорости |
+| `OPENAI_TEMPERATURE` | Температура | пусто, если модель ее не принимает |
+
+На OpenRouter усилие рассуждения уходит как `reasoning.effort`, на остальных endpoint - как `reasoning_effort`.
+
+## Как строится SEO-карточка
+
+1. Основной запрос к модели возвращает заголовок, описание, 3-5 запросов и коммерческий блок.
+2. Ответ проходит проверку фактов: числа, единицы, привязка значений к параметрам, выдуманные характеристики, гарантии, сертификаты, отрасли, служебный текст, повторы.
+3. Описание длиннее 1200 знаков обрезается по границе предложения без обращения к модели.
+4. Описание короче 800 знаков или отклоненное проверкой исправляется одним дополнительным запросом, который переписывает только описание.
+5. Если и после этого текст не годится, сервис возвращает `needs_review` с `seo_description: null` и причиной в `warnings`. Ответ `200`, не `502`.
+
+Больше двух обращений к модели на карточку не бывает. LLM Judge в обычной генерации не вызывается.
+
+Публикуемые поля: `seo_title`, `seo_description`, `specifications`, `search_queries`, `commercial_block`. Диагностика лежит отдельно: `status`, `warnings`, `missing_fields`. Если текста нет, поле равно `null`, а не сообщению об ошибке.
+
+| Статус | Что значит |
+| --- | --- |
+| `complete` | Заголовок до 70 знаков, описание 800-1200, 3-5 запросов, коммерческий блок |
+| `needs_review` | Часть полей не прошла проверку, подтвержденные характеристики сохранены |
+| `insufficient_data` | Подтвержденных данных мало, модель не вызывалась |
+
+## Ручной E2E через OpenRouter
+
+Автотесты не обращаются к сети. Реальные запросы платные, вы запускаете их сами.
+
+Готовые запросы лежат в `examples/`: `manometer.json` (сценарий A), `temperature_sensor.json` (сценарий B) и `thermometer_insufficient.json` (мало данных, ожидается `insufficient_data`).
+
+**Swagger.** Запустите сервис с ключом, откройте `http://127.0.0.1:8000/docs`, выберите `POST /api/v1/products/generate`, в списке примеров запроса выберите `manometer` или `temperature_sensor` и нажмите Execute. Ожидается `status: complete`, `seo_title` до 70 знаков, `seo_description` 800-1200 знаков, 3-5 запросов в `search_queries`.
+
+**PowerShell.**
+
+```powershell
+$env:OPENAI_API_KEY = "<openrouter-key>"
+$env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+$env:OPENAI_MODEL = "openai/gpt-4.1-mini"
+$env:OPENAI_MAX_COMPLETION_TOKENS = "4096"
+$env:OPENAI_REASONING_EFFORT = "low"
+uv run uvicorn app.main:app
+
+# в другом окне
+curl.exe -X POST http://127.0.0.1:8000/api/v1/products/generate `
+  -H "Content-Type: application/json; charset=utf-8" `
+  --data-binary "@examples/manometer.json"
+```
+
+**Скрипт с проверкой контракта** (оба сценария, код выхода 1 при нарушении):
+
+```powershell
+$env:SMOKE_OPENROUTER = "I_UNDERSTAND_THIS_IS_PAID"
+uv run python scripts/openrouter_smoke.py
+```
+
 ## Тесты
 
 ```bash

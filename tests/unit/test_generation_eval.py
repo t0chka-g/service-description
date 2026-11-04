@@ -45,6 +45,12 @@ from app.evals.judge_calibration_cli import (
 from app.evals.judge_checks import check_judge_assessment, quote_in_card
 from app.prompts.judge import build_judge_prompt
 from app.schemas.product import GenerationResult, GenerationStatus
+from tests.texts import NEUTRAL_SENTENCES, with_length
+
+EVIDENCE_QUOTE = NEUTRAL_SENTENCES[0].rstrip(".")
+# Похвала без числа и без слов из детерминированного списка: ее ловит судья, не генератор.
+CLAIM_QUOTE = "оптимальное соотношение"
+CLAIM_SENTENCE = "Здесь оптимальное соотношение возможностей для задач покупателя."
 
 DATASET_IDS = [
     "full_specs",
@@ -112,11 +118,7 @@ def _case(case_id: str):
 
 
 def _pad(seed: str) -> str:
-    filler = " Текст карточки повторяет только подтвержденные сведения."
-    text = seed
-    while len(text) < 820:
-        text += filler
-    return text[:1100]
+    return with_length(seed, 900)
 
 
 def _valid_draft(case_id: str = "full_specs", *, extra: str = "") -> str:
@@ -137,7 +139,7 @@ def _valid_draft(case_id: str = "full_specs", *, extra: str = "") -> str:
                 f"{manufacturer} {head}",
                 f"{head} характеристики {manufacturer}",
             ],
-            "commercial_block": "Цена и гарантия в исходных данных не указаны.",
+            "commercial_block": "Подробности уточняйте у поставщика.",
         },
         ensure_ascii=False,
     )
@@ -151,6 +153,7 @@ def _judge_body(
     critical_errors: list[str] | None = None,
     evidence: list[dict] | None = None,
     seo_score: int | None = None,
+    quote: str = "подтвержденные сведения",
 ) -> str:
     return json.dumps(
         {
@@ -162,7 +165,7 @@ def _judge_body(
             "evidence": evidence
             or [
                 {
-                    "quote": "подтвержденные сведения",
+                    "quote": quote,
                     "kind": "confirmed_fact",
                     "explanation": "Фраза не добавляет новых чисел.",
                 }
@@ -172,6 +175,10 @@ def _judge_body(
         },
         ensure_ascii=False,
     )
+
+
+def _generation_judge_body(**kwargs: object) -> str:
+    return _judge_body(quote=EVIDENCE_QUOTE, **kwargs)  # type: ignore[arg-type]
 
 
 def test_dataset_covers_required_scenarios() -> None:
@@ -203,7 +210,7 @@ async def test_metrics_split_statuses(tmp_path: Path) -> None:
         steps=[_valid_draft(), LLMError("schema", kind=LLMErrorKind.MODEL)],
     )
     judge = ScriptedClient(
-        _judge_body(score=4),
+        _generation_judge_body(score=4),
         usage=LLMUsage(prompt_tokens=10, completion_tokens=10),
     )
 
@@ -250,7 +257,7 @@ async def test_metrics_split_statuses(tmp_path: Path) -> None:
 async def test_api_error_keeps_latency() -> None:
     case = _case("full_specs")
     generator = ScriptedClient(error=LLMError("down", kind=LLMErrorKind.API))
-    judge = ScriptedClient(_judge_body())
+    judge = ScriptedClient(_generation_judge_body())
     report = await run_generation_evaluation(
         [case],
         generator,
@@ -280,7 +287,7 @@ async def test_refusal_preserves_available_usage() -> None:
     report = await run_generation_evaluation(
         [_case("full_specs")],
         generator,
-        ScriptedClient(_judge_body()),
+        ScriptedClient(_generation_judge_body()),
         model="generator-a",
         judge_model="judge-b",
         prices={"generator-a": ModelPrice(prompt_per_million=1.0, completion_per_million=2.0)},
@@ -333,7 +340,7 @@ async def test_cost_without_price_stays_empty() -> None:
     report = await run_generation_evaluation(
         [_case("non_numeric_specs")],
         ScriptedClient(_valid_draft("non_numeric_specs"), usage=usage),
-        ScriptedClient(_judge_body()),
+        ScriptedClient(_generation_judge_body()),
         model="generator-a",
         judge_model="judge-b",
     )
@@ -386,14 +393,14 @@ def test_draft_checks_separate_length_from_schema() -> None:
 
 async def test_fabricated_quote_is_judge_error_not_semantic_issue() -> None:
     claim = {
-        "quote": "лучшая цена",
+        "quote": CLAIM_QUOTE,
         "explanation": "Цены во входе нет.",
         "kind": "unsupported_claim",
     }
     report = await run_generation_evaluation(
         [_case("commercial_claims")],
         ScriptedClient(_valid_draft("commercial_claims")),
-        ScriptedClient(_judge_body(verdict="fail", score=1, claims=[claim])),
+        ScriptedClient(_generation_judge_body(verdict="fail", score=1, claims=[claim])),
         model="generator-a",
         judge_model="judge-b",
     )
@@ -408,16 +415,16 @@ async def test_fabricated_quote_is_judge_error_not_semantic_issue() -> None:
 
 
 async def test_verdict_pass_with_real_claim_needs_review_without_semantic_inflation() -> None:
-    draft = _valid_draft("commercial_claims", extra="лучшая цена на рынке.")
+    draft = _valid_draft("commercial_claims", extra=CLAIM_SENTENCE)
     claim = {
-        "quote": "лучшая цена",
+        "quote": CLAIM_QUOTE,
         "explanation": "Цены во входе нет.",
         "kind": "unsupported_claim",
     }
     report = await run_generation_evaluation(
         [_case("commercial_claims")],
         ScriptedClient(draft),
-        ScriptedClient(_judge_body(verdict="pass", score=4, claims=[claim])),
+        ScriptedClient(_generation_judge_body(verdict="pass", score=4, claims=[claim])),
         model="generator-a",
         judge_model="judge-b",
     )
@@ -429,16 +436,16 @@ async def test_verdict_pass_with_real_claim_needs_review_without_semantic_inflat
 
 
 async def test_consistent_fail_with_real_quote_counts_semantic_issue() -> None:
-    draft = _valid_draft("commercial_claims", extra="лучшая цена на рынке.")
+    draft = _valid_draft("commercial_claims", extra=CLAIM_SENTENCE)
     claim = {
-        "quote": "лучшая цена",
+        "quote": CLAIM_QUOTE,
         "explanation": "Цены во входе нет.",
         "kind": "unsupported_claim",
     }
     report = await run_generation_evaluation(
         [_case("commercial_claims")],
         ScriptedClient(draft),
-        ScriptedClient(_judge_body(verdict="fail", score=1, claims=[claim])),
+        ScriptedClient(_generation_judge_body(verdict="fail", score=1, claims=[claim])),
         model="generator-a",
         judge_model="judge-b",
     )
@@ -452,7 +459,7 @@ async def test_fail_without_confirmed_violation_is_inconsistent() -> None:
     report = await run_generation_evaluation(
         [_case("full_specs")],
         ScriptedClient(_valid_draft("full_specs")),
-        ScriptedClient(_judge_body(verdict="fail", score=1)),
+        ScriptedClient(_generation_judge_body(verdict="fail", score=1)),
         model="generator-a",
         judge_model="judge-b",
     )

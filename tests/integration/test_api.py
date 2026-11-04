@@ -16,6 +16,7 @@ from app.schemas.product import (
     SEO_TITLE_MAX_LENGTH,
     GenerationResult,
 )
+from tests.texts import with_length
 
 API_ROOT = Path(__file__).resolve().parents[2] / "app" / "api"
 GENERATE_PATH = "/api/v1/products/generate"
@@ -31,7 +32,7 @@ _SPECS = {
     "Присоединение": "M20x1,5",
     "Степень защиты": "IP54",
 }
-_PAD = " Сведения приведены только по подтвержденным характеристикам."
+
 
 
 class ScriptedLLM:
@@ -90,9 +91,7 @@ def _grounded_generation(specs: dict[str, str]) -> str:
     confirmed = [(name, value) for name, value in specs.items() if value.strip()]
     parts = [_NAME, f"Производитель: {_MANUFACTURER}."]
     parts.extend(f"{name}: {value}." for name, value in confirmed)
-    description = " ".join(parts)
-    while len(description) < 850:
-        description += _PAD
+    description = with_length(" ".join(parts), 900)
     assert SEO_DESCRIPTION_MIN_LENGTH <= len(description) <= 1200
     first_name, first_value = confirmed[0]
     draft = {
@@ -284,7 +283,8 @@ async def test_omitted_fields_return_insufficient_data_without_llm(
     assert body["status"] == "insufficient_data"
     assert body["seo_title"] == "Товар"
     assert body["search_queries"] == []
-    assert len(body["seo_description"]) < SEO_DESCRIPTION_MIN_LENGTH
+    assert body["seo_description"] is None
+    assert body["commercial_block"] is None
     assert any(item["code"] == "insufficient_data" for item in body["warnings"])
 
 
@@ -307,6 +307,7 @@ async def test_sparse_product_is_insufficient_data(
     assert body["status"] == "insufficient_data"
     assert body["specifications"][0]["value"] == "0...100 °C"
     assert body["specifications"][0]["source"] == "specs"
+    assert body["seo_description"] is None
     assert any(item["code"] == "insufficient_data" for item in body["warnings"])
 
 
@@ -597,3 +598,85 @@ async def test_successful_card_matches_declared_schema(
     assert SEO_DESCRIPTION_MIN_LENGTH <= len(card.seo_description) <= 1200
     assert len(card.search_queries) == 3
     assert card.commercial_block.startswith(_NAME)
+
+
+async def test_short_description_is_repaired_through_api(
+    client: AsyncClient,
+    install_llm: Any,
+) -> None:
+    short = json.loads(_grounded_generation(_SPECS))
+    short["seo_description"] = " ".join([_NAME, f"Производитель: {_MANUFACTURER}."])
+    repaired = {"seo_description": json.loads(_grounded_generation(_SPECS))["seo_description"]}
+    script = ScriptedLLM([json.dumps(short, ensure_ascii=False), json.dumps(repaired)])
+    install_llm(script)
+    response = await client.post(GENERATE_PATH, json=_product())
+
+    assert response.status_code == 200
+    card = _assert_matches_response_model(response.json())
+    assert card.status.value == "complete"
+    assert card.seo_description == repaired["seo_description"]
+    assert len(script.prompts) == 2
+    assert not script.prompts[1].startswith("Собери SEO-карточку")
+
+
+async def test_failed_repair_returns_partial_card_without_service_text(
+    client: AsyncClient,
+    install_llm: Any,
+) -> None:
+    short = json.loads(_grounded_generation(_SPECS))
+    short["seo_description"] = f"{_NAME}. Производитель: {_MANUFACTURER}."
+    install_llm(ScriptedLLM([json.dumps(short, ensure_ascii=False), json.dumps(short)]))
+    response = await client.post(GENERATE_PATH, json=_product())
+
+    assert response.status_code == 200
+    body = response.json()
+    card = _assert_matches_response_model(body)
+    assert card.status.value == "needs_review"
+    assert body["seo_description"] is None
+    assert [item["value"] for item in body["specifications"]] == list(_SPECS.values())
+    assert len(body["search_queries"]) == 3
+    assert body["commercial_block"]
+    codes = {item["code"] for item in body["warnings"]}
+    assert {"description_too_short", "needs_review"} <= codes
+    published = "\n".join(
+        [body["seo_title"], body["commercial_block"], *body["search_queries"]]
+    ).casefold()
+    for marker in ("не собрано", "недостаточно", "подтвержд"):
+        assert marker not in published
+
+
+async def test_unparseable_generation_returns_partial_card_json(
+    client: AsyncClient,
+    install_llm: Any,
+) -> None:
+    install_llm(ScriptedLLM(["{"]))
+    response = await client.post(GENERATE_PATH, json=_product())
+
+    assert response.status_code == 200
+    body = response.json()
+    _assert_matches_response_model(body)
+    assert body["seo_description"] is None
+    assert body["commercial_block"] is None
+    assert {item["code"] for item in body["warnings"]} >= {"generation_failed", "needs_review"}
+
+
+async def test_openapi_documents_complete_and_partial_results(client: AsyncClient) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    card = schema["components"]["schemas"]["GenerationResult"]
+    variants = card["properties"]["seo_description"]["anyOf"]
+    description_types = {item.get("type") for item in variants}
+    assert description_types == {"string", "null"}
+    assert "seo_description" not in card.get("required", [])
+    examples = schema["paths"][GENERATE_PATH]["post"]["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]
+    assert {"complete", "needs_review", "insufficient_data"} <= set(examples)
+    # FastAPI убирает null из OpenAPI-схемы, поэтому ключа может не быть вовсе.
+    assert examples["needs_review"]["value"].get("seo_description") is None
+    assert examples["insufficient_data"]["value"].get("seo_description") is None
+    for example in examples.values():
+        GenerationResult.model_validate(example["value"])
+    requests = schema["paths"][GENERATE_PATH]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["examples"]
+    assert {"manometer", "temperature_sensor"} <= set(requests)

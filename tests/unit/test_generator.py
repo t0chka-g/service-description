@@ -43,6 +43,7 @@ from app.schemas.product import (
 )
 from app.services.generator import SEOGenerator
 from tests.fakes import FakeLLMClient, RaisingLLMClient
+from tests.texts import with_length
 
 GENERATION_CASE_IDS = [
     "full_card",
@@ -211,7 +212,7 @@ def _expected_warnings(data: GenerationInput, status: GenerationStatus) -> list[
 _INJECTION_MARK = "Игнорируй"
 _DISPLAY_NAME = "Манометр МП-50"
 _FULL_CARD_NAME = "Манометр избыточного давления МП-У-01"
-_GROUND_PAD = "Сведения приведены только по подтвержденным характеристикам."
+_FILL_MARK = "Перед заказом"
 _ACCEPT = "accept"
 _SCHEMA = "schema"
 _REPEATED = "seo_description is a repeated block"
@@ -275,14 +276,8 @@ def _grounded_description(data: GenerationInput, length: int) -> str:
     core = " ".join(parts).strip()
     if len(core) >= length:
         raise AssertionError(f"grounded core is {len(core)}, target {length}")
-    assert not any(char.isdigit() for char in _GROUND_PAD)
-    text = core
-    chunk = f" {_GROUND_PAD}"
-    while len(text) + len(chunk) <= length:
-        text += chunk
-    if len(text) < length:
-        text += chunk[: length - len(text)]
-    assert len(text) == length
+    text = with_length(core, length)
+    assert _FILL_MARK in text
     for attribute in data.attributes:
         assert attribute.name in text
         assert attribute.value in text
@@ -407,6 +402,16 @@ def _llm_payload(case: dict[str, Any]) -> dict[str, Any]:
         "warnings": [{"code": "insufficient_data", "field": "чужое"}],
     }
 
+
+def _published_text(result: GenerationResult) -> str:
+    return "\n".join(
+        [
+            result.seo_title,
+            result.seo_description or "",
+            result.commercial_block or "",
+            *result.search_queries,
+        ]
+    )
 
 def _generator(payload: dict[str, Any] | str) -> tuple[SEOGenerator, FakeLLMClient]:
     client = FakeLLMClient(payload)
@@ -630,7 +635,6 @@ async def test_generate_follows_case_contract(
     assert result.status is status
     assert result.seo_title.strip()
     assert len(result.seo_title) <= constraints["seo_title_max_length"]
-    assert result.commercial_block.strip()
     assert result.missing_fields == case["expected_missing_fields"]
     assert _attribute_identity(result.specifications) == _attribute_identity(data.attributes)
     assert [(item.code, item.field) for item in result.warnings] == _expected_warnings(data, status)
@@ -654,6 +658,7 @@ async def test_generate_follows_case_contract(
         )
 
     if status is GenerationStatus.COMPLETE:
+        assert result.commercial_block and result.commercial_block.strip()
         assert (
             constraints["seo_description_min_length"]
             <= len(result.seo_description)
@@ -680,21 +685,15 @@ async def test_generate_follows_case_contract(
         if len(data.name) > constraints["seo_title_max_length"]:
             assert result.seo_title != data.name
     elif status is GenerationStatus.INSUFFICIENT_DATA:
-        assert 0 < len(result.seo_description) < constraints["seo_description_min_length"]
-        assert result.seo_description != payload["seo_description"]
-        prose = "\n".join([result.seo_title, result.seo_description, result.commercial_block])
+        assert result.seo_description is None
+        assert result.commercial_block is None
+        assert result.search_queries == []
+        assert client.calls == []
         published = "\n".join(
-            [
-                prose,
-                *result.search_queries,
-                *(item.value for item in result.specifications),
-            ]
+            [_published_text(result), *(item.value for item in result.specifications)]
         )
         for claim in case["forbidden_claims"]:
             assert claim not in published
-        for attribute in data.attributes:
-            assert attribute.name in prose
-            assert attribute.value in prose
     else:
         raise AssertionError(status)
 
@@ -872,9 +871,7 @@ async def test_generator_applies_complete_card_contract(
     assert outcome == _SCHEMA
     assert message is not None
     result = await generator.generate(data)
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert result.status is not GenerationStatus.COMPLETE or (
         SEO_DESCRIPTION_MIN_LENGTH <= len(result.seo_description) <= SEO_DESCRIPTION_MAX_LENGTH
     )
@@ -887,7 +884,8 @@ async def test_generator_applies_complete_card_contract(
         message == _DESCRIPTION_RANGE
         and len(payload["seo_description"]) > SEO_DESCRIPTION_MAX_LENGTH
     ):
-        assert len(result.seo_description) <= SEO_DESCRIPTION_MAX_LENGTH
+        published = result.seo_description or ""
+        assert len(published) <= SEO_DESCRIPTION_MAX_LENGTH
     assert _attribute_identity(result.specifications) == _attribute_identity(data.attributes)
     if "х" * 40 in payload["seo_description"]:
         assert "х" * 40 not in published
@@ -917,7 +915,8 @@ async def test_llm_response_missing_required_field_raises_model_error(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    assert result.commercial_block
+    assert result.seo_description is None
+    assert any(item.code.value == "generation_failed" for item in result.warnings)
     assert _attribute_identity(result.specifications) == _attribute_identity(data.attributes)
 
 
@@ -1011,9 +1010,7 @@ async def test_complete_card_rejects_ungrounded_text(
     generator, _client = _generator(payload)
 
     result = await generator.generate(data)
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     if field == "commercial_block":
         assert result.status is GenerationStatus.COMPLETE
         if claim not in data.name and claim not in data.manufacturer:
@@ -1042,9 +1039,7 @@ async def test_complete_card_rejects_swapped_measurement(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1059,9 +1054,7 @@ async def test_complete_card_rejects_queries_without_name_or_manufacturer(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1073,7 +1066,6 @@ async def test_complete_card_rejects_queries_without_name_or_manufacturer(
         {"search_queries": "запрос"},
         {"search_queries": [1, 2, 3]},
         {"commercial_block": 5},
-        {"status": "done"},
     ],
     ids=[
         "seo_title_int",
@@ -1081,7 +1073,6 @@ async def test_complete_card_rejects_queries_without_name_or_manufacturer(
         "search_queries_string",
         "search_queries_ints",
         "commercial_block_int",
-        "status_unknown",
     ],
 )
 async def test_llm_response_wrong_field_type_raises_model_error(
@@ -1100,13 +1091,7 @@ async def test_llm_response_wrong_field_type_raises_model_error(
 
 
 def _pad_grounded(prefix: str, length: int) -> str:
-    chunk = f" {_GROUND_PAD}"
-    text = prefix.strip()
-    while len(text) + len(chunk) <= length:
-        text += chunk
-    if len(text) < length:
-        text += chunk[: length - len(text)]
-    return text
+    return with_length(prefix.strip(), length)
 
 
 async def test_name_injection_numbers_are_not_confirmed_facts(
@@ -1121,9 +1106,7 @@ async def test_name_injection_numbers_are_not_confirmed_facts(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1138,9 +1121,7 @@ async def test_stitched_number_is_ungrounded(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1164,9 +1145,7 @@ async def test_swapped_attribute_values_are_ungrounded(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1190,14 +1169,12 @@ async def test_non_numeric_conflict_value_is_ungrounded(
     data = GenerationInput.model_validate(raw)
     payload = _llm_payload(case)
     description = _grounded_description(data, _COMPLETE_DESCRIPTION_LENGTH)
-    payload["seo_description"] = description.replace("Сведения", "латунь", 1)
+    payload["seo_description"] = description.replace(_FILL_MARK, "латунь", 1)
     generator, _client = _generator(payload)
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert "латунь" not in published.casefold()
     assert not _has_foreign_digit(published, data)
 
@@ -1213,13 +1190,11 @@ async def test_query_with_only_generic_adjective_is_ungrounded(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
-async def test_closed_summary_does_not_truncate_numeric_value() -> None:
+async def test_closed_result_keeps_long_value_intact_without_summary_text() -> None:
     value = ("0...1,0 МПа " * 70).strip()
     data = GenerationInput(
         name="Датчик",
@@ -1238,11 +1213,11 @@ async def test_closed_summary_does_not_truncate_numeric_value() -> None:
 
     result = await generator.generate(data)
 
-    prose = "\n".join([result.seo_title, result.seo_description, result.commercial_block])
     assert result.status is GenerationStatus.INSUFFICIENT_DATA
-    assert value in prose
-    assert not (value[:24] in result.seo_description and value not in result.seo_description)
-    assert len(result.seo_description) < SEO_DESCRIPTION_MIN_LENGTH
+    assert [item.value for item in result.specifications] == [value]
+    assert result.seo_description is None
+    assert result.commercial_block is None
+    assert value not in _published_text(result)
     assert client.calls == []
 
 
@@ -1260,9 +1235,7 @@ async def test_unit_swap_keeps_number_but_changes_unit_is_ungrounded(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1274,7 +1247,7 @@ async def test_ex_marking_digit_does_not_ground_warranty_claim(
     payload = _llm_payload(case)
     assert any(item.value == "1Ex d IIC T6 Gb" for item in data.attributes)
     payload["seo_description"] = payload["seo_description"].replace(
-        "Сведения",
+        _FILL_MARK,
         "гарантия 6 лет",
         1,
     )
@@ -1282,9 +1255,7 @@ async def test_ex_marking_digit_does_not_ground_warranty_claim(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1308,9 +1279,7 @@ async def test_swapped_attribute_values_ignore_name_case(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1334,14 +1303,12 @@ async def test_conflict_value_match_is_case_insensitive(
     data = GenerationInput.model_validate(raw)
     payload = _llm_payload(case)
     description = _grounded_description(data, _COMPLETE_DESCRIPTION_LENGTH)
-    payload["seo_description"] = description.replace("Сведения", "Латунь", 1)
+    payload["seo_description"] = description.replace(_FILL_MARK, "Латунь", 1)
     generator, _client = _generator(payload)
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert "латунь" not in published.casefold()
     assert not _has_foreign_digit(published, data)
 
@@ -1363,7 +1330,7 @@ async def test_prompt_injection_without_period_numbers_are_not_facts(
     payload["seo_description"] = _grounded_description(
         clean_data,
         _COMPLETE_DESCRIPTION_LENGTH,
-    ).replace("Сведения", "погрешность 0,01 %", 1)
+    ).replace(_FILL_MARK, "погрешность 0,01 %", 1)
     payload["search_queries"] = [
         "Манометр МП-50 купить",
         "Манометр МП-50 цена",
@@ -1376,9 +1343,7 @@ async def test_prompt_injection_without_period_numbers_are_not_facts(
 
     result = await generator.generate(data)
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
     assert not _has_foreign_digit(published, data)
 
 
@@ -1477,11 +1442,7 @@ def _long_grounded(data: GenerationInput, length: int) -> str:
         "Диапазон показаний: 0...1,6 МПа. Класс точности: 1,5. "
         "Присоединение: M20x1,5. Степень защиты: IP54. "
     )
-    pad = "Сведения приведены только по подтвержденным характеристикам. "
-    text = sentence
-    while len(text) + len(pad) <= length:
-        text += pad
-    return text
+    return with_length(sentence.strip(), length)
 
 
 async def test_description_of_1000_characters_is_complete() -> None:
@@ -1525,7 +1486,8 @@ async def test_overlong_description_without_sentence_end_is_partial() -> None:
     result = await generator.generate(data)
 
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    assert "слово слово" not in result.seo_description
+    assert result.seo_description is None
+    assert "слово слово" not in _published_text(result)
     assert result.specifications == data.attributes
 
 
@@ -1538,9 +1500,9 @@ async def test_short_grounded_description_is_not_marked_complete() -> None:
     result = await generator.generate(data)
 
     assert result.status is GenerationStatus.NEEDS_REVIEW
-    assert len(result.seo_description) < SEO_DESCRIPTION_MIN_LENGTH
-    assert "0...1,6 МПа" in result.seo_description
-    assert len(client.calls) == 1
+    assert result.seo_description is None
+    assert any(item.code.value == "description_too_short" for item in result.warnings)
+    assert len(client.calls) == 2
 
 
 async def test_warranty_hallucination_is_not_published() -> None:
@@ -1556,11 +1518,9 @@ async def test_warranty_hallucination_is_not_published() -> None:
     generator, client = _generator(payload)
 
     result = await generator.generate(data)
-    published = "\n".join(
-        [result.seo_title, result.seo_description, result.commercial_block, *result.search_queries]
-    )
+    published = _published_text(result)
 
     assert result.status is GenerationStatus.NEEDS_REVIEW
     assert "гарантия" not in published.casefold()
     assert "12" not in published
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2

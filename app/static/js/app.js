@@ -22,8 +22,16 @@ const WARNING_LABELS = {
   conflict: "Конфликт между характеристиками и описанием",
   missing_field: "Нет подтвержденного значения",
   insufficient_data: "Данных недостаточно для полной карточки",
-  needs_review: "Текст модели не опубликован",
+  needs_review: "Часть карточки не прошла проверку",
+  generation_failed: "Модель не вернула разбираемый ответ",
+  description_too_short: "Описание короче нормы",
+  description_too_long: "Описание длиннее нормы",
+  description_rejected: "Описание не прошло проверку",
+  search_queries_insufficient: "Недостаточно поисковых запросов",
 };
+
+const NO_DESCRIPTION = "Описание не сформировано. Причина указана в предупреждениях ниже.";
+const NO_COMMERCIAL = "Коммерческий текст не сформирован.";
 
 const SOURCE_LABELS = {
   specs: "Из характеристик",
@@ -486,6 +494,7 @@ function renderCard(card) {
     textBlock({
       title: "SEO-описание",
       text: card.seo_description,
+      emptyText: NO_DESCRIPTION,
       counter: descriptionCounter(card),
       counterTone: partial ? "short" : "",
       copyValue: () => card.seo_description,
@@ -500,6 +509,7 @@ function renderCard(card) {
     textBlock({
       title: "Коммерческий текст",
       text: card.commercial_block,
+      emptyText: NO_COMMERCIAL,
       copyValue: () => card.commercial_block,
       bodyClass: "prose",
     }),
@@ -532,7 +542,7 @@ function verdict(card) {
     element(
       "p",
       review
-        ? "Текст модели нельзя опубликовать целиком. Ниже только подтвержденные сведения."
+        ? "Часть полей не прошла проверку и не опубликована. Подтвержденные характеристики сохранены."
         : partial
           ? "Полное описание не собрано. Ниже только подтвержденные сведения — это не ошибка запроса."
           : "Полная карточка. Проверьте формулировки перед публикацией.",
@@ -542,7 +552,7 @@ function verdict(card) {
   return header;
 }
 
-function textBlock({ title, text, counter, counterTone, copyValue, bodyClass }) {
+function textBlock({ title, text, emptyText, counter, counterTone, copyValue, bodyClass }) {
   const section = document.createElement("section");
   section.className = "result-section";
   const head = document.createElement("div");
@@ -555,9 +565,10 @@ function textBlock({ title, text, counter, counterTone, copyValue, bodyClass }) 
     titles.append(element("p", counter, tone));
   }
   head.append(titles);
-  if (copyValue) head.append(copyButton("Копировать", copyValue));
-  const value = typeof text === "string" && text.trim() ? text : "—";
-  section.append(head, element("p", value, bodyClass || "prose"));
+  const hasText = typeof text === "string" && text.trim() !== "";
+  if (copyValue && hasText) head.append(copyButton("Копировать", copyValue));
+  const value = hasText ? text : emptyText || "—";
+  section.append(head, element("p", value, hasText ? bodyClass || "prose" : "note"));
   return section;
 }
 
@@ -730,7 +741,7 @@ async function writeClipboard(text) {
 }
 
 function toMarkdown(card) {
-  const lines = [`# ${card.seo_title}`, "", card.seo_description, "", "## Технические характеристики", ""];
+  const lines = [`# ${card.seo_title}`, "", card.seo_description || `_${NO_DESCRIPTION}_`, "", "## Технические характеристики", ""];
   if (card.specifications?.length) {
     lines.push("| Параметр | Значение | Источник |", "| --- | --- | --- |");
     for (const item of card.specifications) {
@@ -742,7 +753,7 @@ function toMarkdown(card) {
   }
   lines.push("", "## Поисковые запросы", "");
   lines.push(...listLines(card.search_queries, "Запросы не сформированы."));
-  lines.push("", "## Коммерческий текст", "", card.commercial_block || "—", "", "## Недостающие данные", "");
+  lines.push("", "## Коммерческий текст", "", card.commercial_block || NO_COMMERCIAL, "", "## Недостающие данные", "");
   lines.push(...listLines(card.missing_fields, "Неподтвержденных характеристик нет."));
   lines.push("", "## Предупреждения", "");
   if (!card.warnings?.length) {
@@ -773,7 +784,10 @@ function titleCounter(title) {
 }
 
 function descriptionCounter(card) {
-  const length = String(card.seo_description ?? "").length;
+  if (typeof card.seo_description !== "string") {
+    return `нужно ${DESCRIPTION_MIN}–${DESCRIPTION_MAX} знаков`;
+  }
+  const length = card.seo_description.length;
   if (card.status === "insufficient_data" || card.status === "needs_review") {
     return `${length} ${plural(length, "знак", "знака", "знаков")} · для полной карточки нужно от ${DESCRIPTION_MIN}`;
   }

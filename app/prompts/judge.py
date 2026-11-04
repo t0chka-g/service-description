@@ -94,7 +94,7 @@ def build_judge_prompt(case: GenerationDatasetCase, card: GenerationResult) -> s
             "",
             "Карточка:",
             f"seo_title: {card.seo_title}",
-            f"seo_description: {card.seo_description}",
+            f"seo_description: {card.seo_description or '(нет)'}",
             "search_queries:",
         ]
     )
@@ -102,5 +102,5 @@ def build_judge_prompt(case: GenerationDatasetCase, card: GenerationResult) -> s
         lines.extend(f"- {query}" for query in card.search_queries)
     else:
         lines.append("- нет")
-    lines.append(f"commercial_block: {card.commercial_block}")
+    lines.append(f"commercial_block: {card.commercial_block or '(нет)'}")
     return "\n".join(lines)

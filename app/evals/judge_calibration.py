@@ -825,7 +825,12 @@ def _rate(numerator: int, denominator: int) -> CountRateProxy:
 
 def _card_blob(card: GenerationResult) -> str:
     return "\n".join(
-        [card.seo_title, card.seo_description, card.commercial_block, *card.search_queries]
+        [
+            card.seo_title,
+            card.seo_description or "",
+            card.commercial_block or "",
+            *card.search_queries,
+        ]
     )
 
 
