@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AttributeSource(StrEnum):
+    """Откуда взято подтвержденное значение."""
+
     SPECS = "specs"
     DESCRIPTION = "description"
 
@@ -14,19 +16,38 @@ class AttributeSource(StrEnum):
 class ProductInput(BaseModel):
     """Входные данные товара для извлечения характеристик."""
 
-    name: str = ""
-    manufacturer: str = ""
-    specs: dict[str, str] = Field(default_factory=dict)
-    description: str = ""
+    name: str = Field(
+        default="",
+        description="Название прибора так, как его нужно показать покупателю.",
+    )
+    manufacturer: str = Field(
+        default="",
+        description="Производитель. Пустая строка допустима.",
+    )
+    specs: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Характеристики: имя параметра и значение. "
+            "Пустое значение не считается подтвержденным. "
+            "Ключи этого словаря задают, какие характеристики искать в описании."
+        ),
+    )
+    description: str = Field(
+        default="",
+        description=(
+            "Техническое описание. Из него принимаются только характеристики, "
+            "чьи имена есть среди ключей specs, и только с дословным подтверждением."
+        ),
+    )
 
 
 class ExtractedAttribute(BaseModel):
     """Характеристика с источником и подтверждающим фрагментом."""
 
-    name: str
-    value: str
-    source: AttributeSource
-    evidence: str  # подтверждающий фрагмент
+    name: str = Field(description="Имя характеристики.")
+    value: str = Field(description="Подтвержденное значение без перефразирования.")
+    source: AttributeSource = Field(description="Источник значения: specs или description.")
+    evidence: str = Field(description="Фрагмент, которым подтверждено значение.")
 
 
 class AttributeConflict(BaseModel):
@@ -73,16 +94,20 @@ COMPLETE_MIN_ATTRIBUTES = 3
 
 
 class GenerationStatus(StrEnum):
-    """Полная карточка либо явный отказ добирать текст неподтвержденными фактами."""
+    """Полная карточка, нехватка входных данных или частичный результат без текста модели."""
 
     COMPLETE = "complete"
     INSUFFICIENT_DATA = "insufficient_data"
+    NEEDS_REVIEW = "needs_review"
 
 
 class GenerationWarningCode(StrEnum):
+    """Почему карточку нельзя считать полной или бесспорной."""
+
     CONFLICT = "conflict"
     MISSING_FIELD = "missing_field"
     INSUFFICIENT_DATA = "insufficient_data"
+    NEEDS_REVIEW = "needs_review"
 
 
 class GenerationWarning(BaseModel):
@@ -90,9 +115,12 @@ class GenerationWarning(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    code: GenerationWarningCode
-    field: str = ""
-    message: str = ""
+    code: GenerationWarningCode = Field(description="Код предупреждения.")
+    field: str = Field(
+        default="",
+        description="Имя характеристики, если предупреждение относится к полю.",
+    )
+    message: str = Field(default="", description="Пояснение. Может быть пустым.")
 
 
 class GenerationInput(BaseModel):
@@ -151,7 +179,7 @@ def _validate_search_queries(status: GenerationStatus, queries: list[str]) -> No
                 f"search_queries must contain {SEARCH_QUERIES_MIN}..{SEARCH_QUERIES_MAX} items"
             )
         return
-    if status is GenerationStatus.INSUFFICIENT_DATA:
+    if status is GenerationStatus.INSUFFICIENT_DATA or status is GenerationStatus.NEEDS_REVIEW:
         return
     assert_never(status)
 
@@ -161,14 +189,37 @@ class GenerationResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: GenerationStatus
-    seo_title: str
-    seo_description: str
-    specifications: list[ExtractedAttribute] = Field(default_factory=list)
-    search_queries: list[str] = Field(default_factory=list)
-    commercial_block: str
-    missing_fields: list[str] = Field(default_factory=list)
-    warnings: list[GenerationWarning] = Field(default_factory=list)
+    status: GenerationStatus = Field(
+        description=(
+            "complete — полная карточка. "
+            "insufficient_data — данных мало, текст частичный и не является готовым описанием. "
+            "needs_review — данные есть, но текст модели нельзя опубликовать целиком."
+        )
+    )
+    seo_title: str = Field(description="SEO-заголовок не длиннее 70 символов.")
+    seo_description: str = Field(
+        description=(
+            "SEO-описание. У полной карточки от 800 до 1200 символов. "
+            "При нехватке данных текст короче 800 символов."
+        )
+    )
+    specifications: list[ExtractedAttribute] = Field(
+        default_factory=list,
+        description="Подтвержденные характеристики. Ответ модели их не подменяет.",
+    )
+    search_queries: list[str] = Field(
+        default_factory=list,
+        description="Поисковые запросы. При нехватке данных список может быть пустым.",
+    )
+    commercial_block: str = Field(description="Коммерческий блок по подтвержденным данным.")
+    missing_fields: list[str] = Field(
+        default_factory=list,
+        description="Имена характеристик, которые не удалось подтвердить.",
+    )
+    warnings: list[GenerationWarning] = Field(
+        default_factory=list,
+        description="Предупреждения о конфликтах, пропусках и нехватке данных.",
+    )
 
     @model_validator(mode="after")
     def enforce_contract(self) -> Self:
@@ -194,6 +245,12 @@ class GenerationResult(BaseModel):
                 raise ValueError(
                     "seo_description must stay below "
                     f"{SEO_DESCRIPTION_MIN_LENGTH} characters when data is insufficient"
+                )
+        elif self.status is GenerationStatus.NEEDS_REVIEW:
+            if description_length > SEO_DESCRIPTION_MAX_LENGTH:
+                raise ValueError(
+                    "seo_description length must be at most "
+                    f"{SEO_DESCRIPTION_MAX_LENGTH} characters"
                 )
         else:
             assert_never(self.status)

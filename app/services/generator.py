@@ -1,6 +1,7 @@
 """Генерация SEO-контента карточки товара по проверенному результату Extractor."""
 
 import json
+import logging
 import re
 from collections import Counter
 from typing import assert_never
@@ -10,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from app.clients.llm import LLMClient, LLMError, LLMErrorKind
 from app.prompts.generation import build_generation_prompt
 from app.schemas.product import (
+    SEARCH_QUERIES_MAX,
+    SEARCH_QUERIES_MIN,
+    SEO_DESCRIPTION_MAX_LENGTH,
     SEO_DESCRIPTION_MIN_LENGTH,
     SEO_TITLE_MAX_LENGTH,
     GenerationInput,
@@ -33,6 +37,8 @@ _NUMBER = re.compile(
 )
 _REPEATED = "seo_description is a repeated block"
 _UNGROUNDED = "ungrounded content in the model response"
+_UNGROUNDED_REASON = "число не лежит целиком внутри подтвержденного значения или названия"
+logger = logging.getLogger("uvicorn.error")
 
 
 class GenerationDraft(BaseModel):
@@ -75,14 +81,20 @@ class SEOGenerator:
         assert_never(status)
 
     async def _generate_complete(self, data: GenerationInput) -> GenerationResult:
+        draft = await self._complete_draft(build_generation_prompt(data))
+        if draft is None:
+            return _review_result(data)
+        return _from_complete_gate(data, draft)
+
+    async def _complete_draft(self, prompt: str) -> GenerationDraft | None:
         try:
-            raw = await self._llm_client.complete(
-                build_generation_prompt(data),
-                response_model=GenerationDraft,
-            )
+            raw = await self._llm_client.complete(prompt, response_model=GenerationDraft)
         except TimeoutError as exc:
             raise LLMError("LLM request timed out", kind=LLMErrorKind.API) from exc
-        return _from_complete_gate(data, _parse_generation_response(raw))
+        try:
+            return _parse_generation_response(raw)
+        except LLMError:
+            return None
 
 
 def _parse_generation_response(raw: str) -> GenerationDraft:
@@ -96,41 +108,188 @@ def _parse_generation_response(raw: str) -> GenerationDraft:
 
 
 def _from_complete_gate(data: GenerationInput, draft: GenerationDraft) -> GenerationResult:
-    if not draft.seo_description.strip():
-        raise LLMError("seo_description is empty", kind=LLMErrorKind.MODEL)
-    _reject_invalid_shape(draft, description=draft.seo_description)
-    if _is_repeated_block(draft.seo_description):
-        raise LLMError(_REPEATED, kind=LLMErrorKind.MODEL)
-    _reject_ungrounded(
-        data,
-        draft.seo_title,
-        draft.seo_description,
-        draft.commercial_block,
-        draft.search_queries,
-    )
+    """Собрать карточку. Длину чинит обрезка, не второй вызов модели."""
+
+    description = _candidate_description(data, draft.seo_description)
+    title = _candidate_title(data, draft.seo_title)
+    commercial = _candidate_commercial(data, draft.commercial_block)
+    queries = _candidate_queries(data, draft.search_queries)
+    if (
+        description is not None
+        and SEO_DESCRIPTION_MIN_LENGTH <= len(description) <= SEO_DESCRIPTION_MAX_LENGTH
+        and len(queries) >= SEARCH_QUERIES_MIN
+        and _package_ok(data, title, description, commercial, queries)
+    ):
+        return _result(
+            data,
+            status=GenerationStatus.COMPLETE,
+            title=title,
+            description=description,
+            queries=queries,
+            commercial=commercial,
+        )
+    if description is None:
+        description, fallback_commercial = _closed_copy(data)
+        if commercial == draft.commercial_block.strip() and not _field_ok(data, commercial):
+            commercial = fallback_commercial
     return _result(
         data,
-        status=GenerationStatus.COMPLETE,
-        title=draft.seo_title,
-        description=draft.seo_description,
-        queries=list(draft.search_queries),
-        commercial=draft.commercial_block,
+        status=GenerationStatus.NEEDS_REVIEW,
+        title=title,
+        description=description,
+        queries=queries,
+        commercial=commercial,
     )
 
 
-def _reject_invalid_shape(draft: GenerationDraft, *, description: str) -> None:
-    """Проверить ответ по схеме полной карточки, без подмены текста."""
+def _candidate_description(data: GenerationInput, raw: str) -> str | None:
+    if not raw.strip() or _is_repeated_block(raw.strip()):
+        return None
+    text = raw
+    if len(text) > SEO_DESCRIPTION_MAX_LENGTH:
+        text = _trim_at_sentence(text.strip()) or ""
+        if not text:
+            return None
+    if not _field_ok(data, text):
+        return None
+    return text
 
+
+def _candidate_title(data: GenerationInput, raw: str) -> str:
+    title = raw.strip()
+    fallback = _closed_title(data)
+    catalog = trusted_product_title(data.name)
+    if title and len(title) <= SEO_TITLE_MAX_LENGTH and (
+        title == catalog or _is_cut_title(title, catalog) or title == fallback
+    ):
+        return title
+    if not title or len(title) > SEO_TITLE_MAX_LENGTH or not _field_ok(data, title):
+        return fallback
+    return title
+
+
+def _candidate_commercial(data: GenerationInput, raw: str) -> str:
+    text = raw.strip()
+    if text and _field_ok(data, text):
+        return text
+    return _closed_copy(data)[1]
+
+
+def _candidate_queries(data: GenerationInput, queries: list[str]) -> list[str]:
+    kept: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        text = query.strip()
+        folded = text.casefold()
+        if not text or folded in seen or not _query_is_grounded(text, data):
+            continue
+        if not _query_numbers_ok(data, text):
+            continue
+        seen.add(folded)
+        kept.append(text)
+        if len(kept) == SEARCH_QUERIES_MAX:
+            break
+    return kept
+
+
+def _query_numbers_ok(data: GenerationInput, text: str) -> bool:
+    title = trusted_product_title(data.name)
+    free_tokens = {_fold_technical(token) for token in _NUMBER.findall(title)}
     try:
-        GenerationResult(
-            status=GenerationStatus.COMPLETE,
-            seo_title=draft.seo_title,
-            seo_description=description,
-            search_queries=list(draft.search_queries),
-            commercial_block=draft.commercial_block,
+        _reject_ungrounded_numbers(
+            "search_query",
+            text,
+            _fact_blobs(data),
+            _identity_blobs(data),
+            free_tokens=free_tokens,
         )
-    except ValidationError as exc:
-        raise LLMError(str(exc), kind=LLMErrorKind.MODEL) from exc
+    except LLMError:
+        return False
+    return not _has_conflict_value(data, [text]) and not _has_swapped_value(data, [text])
+
+
+def _package_ok(
+    data: GenerationInput,
+    title: str,
+    description: str,
+    commercial: str,
+    queries: list[str],
+) -> bool:
+    try:
+        _reject_ungrounded(data, title, description, commercial, queries)
+    except LLMError:
+        return False
+    return True
+
+
+def _field_ok(data: GenerationInput, text: str) -> bool:
+    try:
+        _reject_ungrounded_numbers("field", text, _fact_blobs(data), _identity_blobs(data))
+    except LLMError:
+        return False
+    return not _has_conflict_value(data, [text]) and not _has_swapped_value(data, [text])
+
+
+def _trim_at_sentence(text: str) -> str | None:
+    """Последний конец предложения внутри 800–1200 символов, без разрезания значений."""
+
+    ends = [
+        pos
+        for pos in _sentence_ends(text)
+        if SEO_DESCRIPTION_MIN_LENGTH <= pos <= SEO_DESCRIPTION_MAX_LENGTH
+    ]
+    if not ends:
+        return None
+    trimmed = text[: max(ends)].rstrip()
+    if not SEO_DESCRIPTION_MIN_LENGTH <= len(trimmed) <= SEO_DESCRIPTION_MAX_LENGTH:
+        return None
+    return trimmed
+
+
+def _sentence_ends(text: str) -> list[int]:
+    ends: list[int] = []
+    for match in re.finditer(r"[.!?…](?=\s|$)", text):
+        punct_at = match.start()
+        if text[punct_at] == "." and _is_internal_dot(text, punct_at):
+            continue
+        ends.append(match.end())
+    return ends
+
+
+def _is_internal_dot(text: str, index: int) -> bool:
+    if index > 0 and text[index - 1] == ".":
+        return True
+    if (
+        index > 0
+        and index + 1 < len(text)
+        and text[index - 1].isdigit()
+        and text[index + 1].isdigit()
+    ):
+        return True
+    word = text[:index].split()[-1] if text[:index].split() else ""
+    token = word.casefold().strip(".")
+    if token in _ABBREVIATIONS:
+        return True
+    return len(word) <= 2 and word.isalpha()
+
+
+_ABBREVIATIONS = frozenset(
+    {
+        "т",
+        "см",
+        "мм",
+        "кг",
+        "мг",
+        "им",
+        "др",
+        "пр",
+        "рис",
+        "ул",
+        "стр",
+        "напр",
+        "гост",
+    }
+)
 
 
 def _reject_ungrounded(
@@ -140,18 +299,24 @@ def _reject_ungrounded(
     commercial: str,
     queries: list[str],
 ) -> None:
-    prose = [title, description, commercial]
-    fields = [*prose, *queries]
+    prose = [
+        ("seo_title", title),
+        ("seo_description", description),
+        ("commercial_block", commercial),
+    ]
+    fields = [text for _, text in prose]
+    fields.extend(queries)
     catalog_title = trusted_product_title(data.name)
     fact_blobs = _fact_blobs(data)
     identity_blobs = _identity_blobs(data)
-    title_numbers = set(_NUMBER.findall(catalog_title))
-    for field in prose:
+    title_numbers = {_fold_technical(token) for token in _NUMBER.findall(catalog_title)}
+    for name, field in prose:
         if _is_cut_title(field, catalog_title):
             continue
-        _reject_ungrounded_numbers(field, fact_blobs, identity_blobs)
-    for query in queries:
+        _reject_ungrounded_numbers(name, field, fact_blobs, identity_blobs)
+    for index, query in enumerate(queries):
         _reject_ungrounded_numbers(
+            f"search_queries[{index}]",
             query,
             fact_blobs,
             identity_blobs,
@@ -164,21 +329,55 @@ def _reject_ungrounded(
 
 
 def _reject_ungrounded_numbers(
+    field_name: str,
     field: str,
     fact_blobs: list[str],
     identity_blobs: list[str],
     *,
     free_tokens: set[str] | None = None,
 ) -> None:
+    """Отклонить число, которое не входит в подтвержденный фрагмент.
+
+    Сверка идет по нормализованной записи: запятая и точка в десятичной дроби,
+    разделители диапазона, знаки умножения в резьбе и пробел в IP54 эквивалентны.
+    Единицы и чужие числа из-за этого не становятся допустимыми.
+    """
+
+    folded = _fold_technical(field)
+    folded_facts = [_fold_technical(blob) for blob in fact_blobs]
+    folded_identity = [_fold_technical(blob) for blob in identity_blobs]
     allowed_free = free_tokens or set()
-    for start, end, token in _number_spans(field):
-        if _span_covered(field, start, end, fact_blobs):
+    for start, end, token in _number_spans(folded):
+        if _span_covered(folded, start, end, folded_facts):
             continue
-        if _span_covered(field, start, end, identity_blobs):
+        if _span_covered(folded, start, end, folded_identity):
             continue
         if token in allowed_free:
             continue
-        raise LLMError(_UNGROUNDED, kind=LLMErrorKind.MODEL)
+        snippet = folded[max(0, start - 30) : min(len(folded), end + 30)]
+        logger.warning(
+            "ungrounded number field=%s token=%s snippet=%s reason=%s allowed=%s",
+            field_name,
+            token,
+            snippet,
+            _UNGROUNDED_REASON,
+            fact_blobs,
+        )
+        raise LLMError(
+            f"{_UNGROUNDED}: {field_name} contains {token}",
+            kind=LLMErrorKind.MODEL,
+        )
+
+
+def _fold_technical(text: str) -> str:
+    """Свести эквивалентную техническую запись к одному виду, не меняя цифры."""
+
+    folded = text.translate(str.maketrans({"×": "x", "х": "x", "Х": "x"}))
+    folded = re.sub(r"(?<=\d)\s*x\s*(?=\d)", "x", folded)
+    folded = re.sub(r"(?<=\d)\s*(?:\.{2,3}|…)\s*(?=\d)", "...", folded)
+    folded = re.sub(r"(?<=\d)\s*[-–—−]\s*(?=\d)", "...", folded)
+    folded = re.sub(r"(?<=\d)\.(?=\d)", ",", folded)
+    return re.sub(r"IP[\s-]*(\d{2})\b", r"IP\1", folded, flags=re.IGNORECASE)
 
 
 def _closed_result(data: GenerationInput) -> GenerationResult:
@@ -186,6 +385,18 @@ def _closed_result(data: GenerationInput) -> GenerationResult:
     return _result(
         data,
         status=GenerationStatus.INSUFFICIENT_DATA,
+        title=_closed_title(data),
+        description=description,
+        queries=[],
+        commercial=commercial,
+    )
+
+
+def _review_result(data: GenerationInput) -> GenerationResult:
+    description, commercial = _closed_copy(data)
+    return _result(
+        data,
+        status=GenerationStatus.NEEDS_REVIEW,
         title=_closed_title(data),
         description=description,
         queries=[],
@@ -225,6 +436,8 @@ def _warnings(data: GenerationInput, status: GenerationStatus) -> list[Generatio
     )
     if status is GenerationStatus.INSUFFICIENT_DATA:
         warnings.append(GenerationWarning(code=GenerationWarningCode.INSUFFICIENT_DATA, field=""))
+    elif status is GenerationStatus.NEEDS_REVIEW:
+        warnings.append(GenerationWarning(code=GenerationWarningCode.NEEDS_REVIEW, field=""))
     return warnings
 
 

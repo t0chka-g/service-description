@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-6.1-sol"
     openai_base_url: str | None = None
+    # Пустое значение не ограничивает ответ. Лимит в токенах, не в символах.
+    openai_max_completion_tokens: int | None = None
     # Список моделей генерации и отдельный судья. Пустые значения не вызывают API.
     eval_generator_models: str = ""
     eval_judge_model: str = ""

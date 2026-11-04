@@ -71,6 +71,7 @@ class OpenAILLMClient:
         base_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         temperature: float | None = None,
+        max_completion_tokens: int | None = None,
     ) -> None:
         if not api_key.strip():
             raise LLMError("OPENAI_API_KEY is empty", kind=LLMErrorKind.API)
@@ -79,6 +80,7 @@ class OpenAILLMClient:
         self._model = model
         self._timeout = timeout
         self._temperature = temperature
+        self._max_completion_tokens = max_completion_tokens
         self.last_call: LLMCallMeta | None = None
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -101,6 +103,8 @@ class OpenAILLMClient:
         }
         if self._temperature is not None:
             request["temperature"] = self._temperature
+        if self._max_completion_tokens is not None:
+            request["max_completion_tokens"] = self._max_completion_tokens
         try:
             completion = await self._client.chat.completions.parse(**request)
         except OpenAIError as exc:

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Карточки приборов</title>
+    <meta
+      name="description"
+      content="Рабочее место для сборки SEO-карточки измерительного прибора по подтвержденным характеристикам."
+    />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f3f1eb" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%231c1a17'/%3E%3Crect x='6' y='15' width='20' height='2' fill='%23f3f1eb'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/static/css/styles.css" />
+  </head>
+  <body>
+    <a class="skip" href="#result">К карточке</a>
+
+    <header class="mast">
+      <div class="mast-inner">
+        <div class="brand">
+          <div class="brand-text">
+            <p class="brand-name">Карточки приборов</p>
+          </div>
+        </div>
+        <a class="mast-link" href="/docs">Документация API</a>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="source" aria-labelledby="input-heading">
+        <header class="pane-head">
+          <h1 id="input-heading">Исходные данные</h1>
+          <p class="pane-note">
+            Сервис сверяет таблицу с описанием и собирает черновик.
+          </p>
+        </header>
+
+        <form id="product-form" novalidate autocomplete="off">
+          <p id="form-alert" class="callout" role="alert" hidden></p>
+
+          <fieldset class="group">
+            <legend><span class="idx" aria-hidden="true">01</span>Прибор</legend>
+
+            <div class="field">
+              <div class="label-row">
+                <label for="product-name">Название прибора</label>
+                <span class="meta">обязательно</span>
+              </div>
+              <input
+                id="product-name"
+                name="name"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                aria-required="true"
+                placeholder="Например, манометр МП-Демо-01"
+              />
+              <p id="product-name-error" class="field-error" hidden></p>
+            </div>
+
+            <div class="field">
+              <div class="label-row">
+                <label for="product-manufacturer">Производитель</label>
+                <span class="meta">необязательно</span>
+              </div>
+              <input
+                id="product-manufacturer"
+                name="manufacturer"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Если указан в паспорте"
+              />
+              <p id="product-manufacturer-error" class="field-error" hidden></p>
+            </div>
+          </fieldset>
+
+          <fieldset class="group">
+            <legend><span class="idx" aria-hidden="true">02</span>Описание</legend>
+            <div class="field">
+              <div class="label-row">
+                <label for="product-description">Техническое описание</label>
+                <span id="description-count" class="meta">необязательно · 0 знаков</span>
+              </div>
+              <textarea
+                id="product-description"
+                name="description"
+                rows="8"
+                placeholder="Фрагмент паспорта или описания поставщика"
+              ></textarea>
+              <p id="product-description-error" class="field-error" hidden></p>
+            </div>
+          </fieldset>
+
+          <fieldset class="group">
+            <legend><span class="idx" aria-hidden="true">03</span>Характеристики</legend>
+            <div class="note-row">
+              <p class="note">
+                Имя параметра определяет, что искать в тексте. Строка с пустым значением
+                сама по себе характеристику не подтверждает.
+              </p>
+              <p id="spec-count" class="meta"></p>
+            </div>
+
+            <div class="editor">
+              <div class="editor-head" aria-hidden="true">
+                <span>Параметр</span>
+                <span>Значение</span>
+                <span class="editor-action-label">Действие</span>
+              </div>
+              <div id="spec-list"></div>
+              <button type="button" id="add-spec" class="add-spec">Добавить характеристику</button>
+            </div>
+            <p id="specs-error" class="field-error" hidden></p>
+          </fieldset>
+
+          <div class="actions">
+            <div class="actions-aux">
+              <button type="button" id="fill-demo" class="button button-secondary">
+                Подставить пример
+              </button>
+              <button type="button" id="clear-form" class="button button-quiet">Очистить</button>
+            </div>
+            <button type="submit" id="generate-button" class="button button-primary">
+              Сгенерировать карточку
+            </button>
+          </div>
+          <p class="footnote">Пример вымышлен и не относится к серийным приборам.</p>
+        </form>
+      </section>
+
+      <section class="draft" aria-labelledby="result-heading">
+        <header class="pane-head">
+          <h2 id="result-heading">Карточка товара</h2>
+          <p class="pane-note">Проверка черновика и копирование в каталог.</p>
+        </header>
+        <div id="result" aria-live="polite" aria-busy="false"></div>
+        <noscript>
+          <p class="note">Для сборки карточки нужен JavaScript.</p>
+        </noscript>
+      </section>
+    </main>
+
+    <p id="copy-status" class="vh" aria-live="polite"></p>
+    <script src="/static/js/app.js" type="module"></script>
+  </body>
+</html>
