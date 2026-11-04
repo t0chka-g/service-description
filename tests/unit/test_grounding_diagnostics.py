@@ -104,31 +104,32 @@ def test_summary_and_full_text_are_logged_for_a_rejected_description(
     )
 
 
-async def test_initial_and_repair_attempts_are_distinguished(
-    debug_log: pytest.LogCaptureFixture,
-) -> None:
-    bad_first = _with_foreign_number()
-    bad_repair = _with_foreign_number().replace("2,5", "4,0")
-    client = ScriptedLLMClient([full_draft(DATA, bad_first), repair_reply(bad_repair)])
-
-    result = await SEOGenerator(client).generate(DATA)
-
-    assert result.status is GenerationStatus.NEEDS_REVIEW
-    lines = _rejections(debug_log)
-    assert len(lines) == 2
-    assert "attempt=initial" in lines[0] and "value='2,5'" in lines[0]
-    assert "attempt=repair" in lines[1] and "value='4,0'" in lines[1]
-
-
-async def test_accepted_repair_is_logged_as_accepted(
+async def test_grounding_rejection_does_not_start_repair(
     debug_log: pytest.LogCaptureFixture,
 ) -> None:
     client = ScriptedLLMClient([full_draft(DATA, _with_foreign_number()), repair_reply(GOOD)])
 
     result = await SEOGenerator(client).generate(DATA)
 
+    assert result.status is GenerationStatus.NEEDS_REVIEW
+    assert result.seo_description is None
+    assert len(client.calls) == 1
+    lines = _rejections(debug_log)
+    assert lines
+    assert all("attempt=initial" in line for line in lines)
+    assert all("attempt=repair" not in line for line in lines)
+
+
+async def test_accepted_repair_is_logged_as_accepted(
+    debug_log: pytest.LogCaptureFixture,
+) -> None:
+    short = with_length(MANOMETER_SENTENCES[0], 700)
+    client = ScriptedLLMClient([full_draft(DATA, short), repair_reply(GOOD)])
+
+    result = await SEOGenerator(client).generate(DATA)
+
     assert result.status is GenerationStatus.COMPLETE
-    assert len(_rejections(debug_log)) == 1
+    assert len(client.calls) == 2
     messages = [record.getMessage() for record in debug_log.records]
     assert f"description accepted attempt=repair length={len(GOOD)}" in messages
 
@@ -265,7 +266,7 @@ async def test_debug_log_has_no_secrets(
 ) -> None:
     secret = "sk-or-v1-secret-for-test-0123456789"
     monkeypatch.setenv("OPENAI_API_KEY", secret)
-    client = ScriptedLLMClient([full_draft(DATA, _with_foreign_number()), repair_reply(GOOD)])
+    client = ScriptedLLMClient([full_draft(DATA, _with_foreign_number())])
 
     await SEOGenerator(client).generate(DATA)
 
@@ -277,7 +278,7 @@ async def test_debug_log_has_no_secrets(
 
 async def test_public_message_does_not_leak_the_rejected_value() -> None:
     client = ScriptedLLMClient(
-        [full_draft(DATA, _with_foreign_number()), repair_reply(_with_foreign_number())]
+        [full_draft(DATA, _with_foreign_number())]
     )
 
     result = await SEOGenerator(client).generate(DATA)

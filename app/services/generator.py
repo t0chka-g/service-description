@@ -92,7 +92,9 @@ class SEOGenerator:
 
     Генератор не читает исходное техническое описание и не извлекает
     характеристики заново. При закрытом шлюзе модель не вызывается.
-    Не больше двух запросов к модели: генерация и одно исправление описания.
+    Не больше двух запросов к модели. Второй запрос бывает только если описание
+    не прошло проверку длины, повторов или служебных фраз. Ошибка grounding
+    повторный запрос не вызывает.
     Слишком длинный текст сначала сокращается по границе предложения без запроса.
 
     Детерминированная проверка чисел смотрит на подтвержденные пары
@@ -119,9 +121,11 @@ class SEOGenerator:
         if draft is None:
             return _failed_result(data)
         check = check_description(data, draft.seo_description)
-        if not check.ok:
+        repair_attempted = False
+        if not check.ok and check.issue is not DescriptionIssue.UNGROUNDED:
+            repair_attempted = True
             check = await self._repair(data, draft.seo_description, check)
-        return _assemble(data, draft, check)
+        return _assemble(data, draft, check, repair_attempted=repair_attempted)
 
     async def _complete_draft(self, prompt: str) -> GenerationDraft | None:
         try:
@@ -163,13 +167,15 @@ def _assemble(
     data: GenerationInput,
     draft: GenerationDraft,
     check: DescriptionCheck,
+    *,
+    repair_attempted: bool,
 ) -> GenerationResult:
     """Собрать результат из независимо проверенных полей."""
 
     queries = _candidate_queries(data, draft.search_queries)
     reasons: list[GenerationWarning] = []
     if not check.ok:
-        reasons.append(_description_warning(check))
+        reasons.append(_description_warning(check, repair_attempted=repair_attempted))
     if len(queries) < SEARCH_QUERIES_MIN:
         reasons.append(
             GenerationWarning(
@@ -193,7 +199,7 @@ def _assemble(
     )
 
 
-def _description_warning(check: DescriptionCheck) -> GenerationWarning:
+def _description_warning(check: DescriptionCheck, *, repair_attempted: bool) -> GenerationWarning:
     """Причина без цитат: чужое число или конфликтное значение в ответ не попадает."""
 
     assert check.issue is not None
@@ -202,10 +208,13 @@ def _description_warning(check: DescriptionCheck) -> GenerationWarning:
         low=SEO_DESCRIPTION_MIN_LENGTH,
         high=SEO_DESCRIPTION_MAX_LENGTH,
     )
+    message = f"Описание не принято: {reason}."
+    if repair_attempted:
+        message += " Автоматическое исправление не помогло."
     return GenerationWarning(
         code=_DESCRIPTION_CODES[check.issue],
         field="seo_description",
-        message=f"Описание не принято: {reason}. Автоматическое исправление не помогло.",
+        message=message,
     )
 
 

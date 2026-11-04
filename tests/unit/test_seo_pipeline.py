@@ -23,6 +23,7 @@ from app.schemas.product import (
     GenerationWarningCode,
 )
 from app.services.generator import DescriptionRepair, SEOGenerator
+from app.services.grounding import grounding_findings
 from tests.fakes import ScriptedLLMClient
 from tests.texts import (
     MANOMETER_SENTENCES,
@@ -413,7 +414,10 @@ async def test_ungrounded_claims_are_rejected_after_single_repair(sentence: str)
     assert result.seo_description is None
     assert sentence not in _published(result)
     assert REJECTED in _codes(result)
-    assert len(client.calls) == 2
+    # Числа и подмена единиц — ошибка grounding, повторного запроса нет.
+    # Обещание без числа по-прежнему уходит в одно исправление.
+    fact_error = bool(grounding_findings(DATA, bad, field_name="seo_description"))
+    assert len(client.calls) == (1 if fact_error else 2)
     _assert_specs_kept(result)
 
 
@@ -426,16 +430,20 @@ async def test_clean_repair_replaces_rejected_description(sentence: str) -> None
     bad = _with_sentence(sentence)
     result, client = await _generate(full_draft(DATA, bad), repair_reply(GOOD))
 
+    if grounding_findings(DATA, bad, field_name="seo_description"):
+        assert result.seo_description is None
+        assert len(client.calls) == 1
+        return
     _assert_complete_card(result)
     assert result.seo_description == GOOD
     assert len(client.calls) == 2
 
 
-async def test_repair_prompt_names_the_ungrounded_number() -> None:
+async def test_ungrounded_number_is_not_sent_to_repair() -> None:
     bad = _with_sentence("Рабочее давление прибора составляет 2,5 МПа.")
     _result, client = await _generate(full_draft(DATA, bad), repair_reply(GOOD))
 
-    assert "2,5" in client.calls[1]
+    assert len(client.calls) == 1
 
 
 async def test_service_phrases_in_description_are_rejected() -> None:

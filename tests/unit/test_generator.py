@@ -1523,4 +1523,4 @@ async def test_warranty_hallucination_is_not_published() -> None:
     assert result.status is GenerationStatus.NEEDS_REVIEW
     assert "гарантия" not in published.casefold()
     assert "12" not in published
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1

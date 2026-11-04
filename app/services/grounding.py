@@ -7,11 +7,13 @@
 Число допустимо, если оно целиком лежит внутри копии подтвержденного значения
 или названия/производителя. Безопасные переформулировки тоже допустимы:
 
+- пробел между числом и той же единицей: «10см» и «10 см»;
 - компонент диапазона с той же единицей: «от 0 до 1,6 МПа» для «0...1,6 МПа»;
 - начало или конец кода из названия или значения: «M20» для «M20x1,5»,
   «Демо-01» для «МП-Демо-01», если код не обрывает число посередине.
 
 Смена единицы, чужое число и склейка частей разных значений по-прежнему отклоняются.
+Цифра внутри кода («2» в «M20x1,5») не считается отдельным значением.
 """
 
 import logging
@@ -31,6 +33,7 @@ _RANGE_SEPARATOR = "..."
 # Слова между компонентами диапазона: «от 0 до 1,6 МПа».
 _RANGE_CONNECTORS = frozenset({"до", "и", "по", "включительно"})
 _UNIT_AFTER_NUMBER = re.compile(r"\s*([°%]?[^\W\d_]*)")
+_ATTACHED_UNIT = re.compile(r"\s*([°µμ]?[^\W\d_]+)")
 _MAX_UNIT_LENGTH = 12
 _CODE_CHARS = re.compile(r"[\w\-]")
 
@@ -370,6 +373,101 @@ def _is_code_fragment(text: str, start: int, end: int, blobs: list[str]) -> bool
     return False
 
 
+def _unit_at(text: str, end: int) -> str:
+    """Единица сразу после числа. Знак умножения в коде «M20x1,5» единицей не считается."""
+
+    if re.match(r"\s*[x×]\d", text[end:], re.IGNORECASE):
+        return ""
+    match = _ATTACHED_UNIT.match(text, end)
+    return match.group(1) if match else ""
+
+
+def _token_is_number(blob: str, token: str) -> bool:
+    """Совпадение целого числового токена, а не цифры внутри «M20» или «DN50»."""
+
+    return any(span == token for _start, _end, span in _number_spans(blob))
+
+
+def _same_unit_spacing(text: str, end: int, token: str, facts: list[str]) -> bool:
+    """«10см» и «10 см» совпадают. Пустая единица и другая единица не совпадают."""
+
+    text_unit = _unit_at(text, end).casefold()
+    if not text_unit:
+        return False
+    for blob in facts:
+        for _start, fact_end, fact_token in _number_spans(blob):
+            if fact_token != token:
+                continue
+            fact_unit = _unit_at(blob, fact_end).casefold()
+            if fact_unit and fact_unit == text_unit:
+                return True
+    return False
+
+
+def _unit_mismatch(token: str, text_unit: str, facts: list[str]) -> tuple[str, str] | None:
+    folded_unit = text_unit.casefold()
+    if not folded_unit:
+        return None
+    for blob in facts:
+        for _start, fact_end, fact_token in _number_spans(blob):
+            if fact_token != token:
+                continue
+            fact_unit = _unit_at(blob, fact_end)
+            if fact_unit and fact_unit.casefold() != folded_unit:
+                return blob, fact_unit
+    return None
+
+
+def _is_decimal_dot(text: str, index: int) -> bool:
+    return (
+        index > 0
+        and index + 1 < len(text)
+        and text[index - 1].isdigit()
+        and text[index + 1].isdigit()
+    )
+
+
+def _sentence_end(text: str, start: int) -> int:
+    for match in re.finditer(r"[.!?…](?=\s|$)", text[start:]):
+        index = start + match.start()
+        if text[index] == "." and _is_decimal_dot(text, index):
+            continue
+        return start + match.end()
+    return len(text)
+
+
+def _sentence_start(text: str, pos: int) -> int:
+    start = 0
+    for match in re.finditer(r"[.!?…](?=\s)", text):
+        if match.end() > pos:
+            break
+        if text[match.start()] == "." and _is_decimal_dot(text, match.start()):
+            continue
+        start = match.end()
+    return start
+
+
+def _inflection_stems(name: str) -> tuple[str, ...]:
+    """Начало слова характеристики, которое переживает падеж: «ширина» → «шири»."""
+
+    stems: list[str] = []
+    for word in re.findall(r"[^\W\d_]+", name.casefold()):
+        if len(word) < 4:
+            continue
+        stem_len = len(word) - 2 if len(word) >= 6 else len(word) - 1
+        if stem_len >= 4:
+            stems.append(word[:stem_len])
+    return tuple(stems)
+
+
+def _owner_named_near(window: str, token_start: int, owner: str) -> bool:
+    """Число стоит рядом с названием своего атрибута, в том числе в другом падеже."""
+
+    words = re.findall(r"[^\W\d_]+", window[:token_start].casefold())
+    stems = _inflection_stems(owner)
+    return any(word.startswith(stem) for word in words[-4:] for stem in stems)
+
+
 def _exclusive_numbers(data: GenerationInput) -> dict[str, set[str]]:
     per_name = {
         item.name: set(NUMBER.findall(item.value))
@@ -383,32 +481,38 @@ def _exclusive_numbers(data: GenerationInput) -> dict[str, set[str]]:
     }
 
 
-def _swapped_hits(data: GenerationInput, text: str) -> Iterator[tuple[str, str, str, str]]:
-    """(имя в тексте, число, владелец числа, окно текста) для числа не у своей характеристики."""
+def _swapped_hits(
+    data: GenerationInput, text: str
+) -> Iterator[tuple[str, str, str, str, int]]:
+    """Число в окне чужой характеристики: имя, токен, владелец, окно, позиция."""
 
     exclusive = _exclusive_numbers(data)
     names = [item.name for item in data.attributes if item.name.strip()]
     for name, window in _attribute_windows(text, names):
-        for token in NUMBER.findall(window):
+        for match in NUMBER.finditer(window):
+            token = match.group()
             owner = next(
                 (item for item, tokens in exclusive.items() if token in tokens),
                 None,
             )
-            if owner is not None and owner.casefold() != name.casefold():
-                yield name, token, owner, window
+            if owner is None or owner.casefold() == name.casefold():
+                continue
+            if _owner_named_near(window, match.start(), owner):
+                continue
+            yield name, token, owner, window, match.start()
 
 
 def _swapped_findings(data: GenerationInput, text: str, field_name: str) -> list[GroundingFinding]:
     values = {item.name: item.value for item in data.attributes}
     findings: list[GroundingFinding] = []
-    for name, token, owner, window in _swapped_hits(data, text):
+    for name, token, owner, window, token_start in _swapped_hits(data, text):
         context = f"{name}{window}"
         findings.append(
             GroundingFinding(
                 kind=FindingKind.SWAPPED_VALUE,
                 field=field_name,
                 value=token,
-                snippet=_around(context, context.find(token), len(token)),
+                snippet=_around(context, len(name) + token_start, len(token)),
                 attribute=f"{name} = {values.get(name, '?')}",
                 reason=(
                     f"число подтверждено только для «{owner}» "
@@ -434,7 +538,7 @@ def _attribute_windows(text: str, names: list[str]) -> list[tuple[str, str]]:
     windows: list[tuple[str, str]] = []
     for index, (_start, end, name) in enumerate(hits):
         next_start = hits[index + 1][0] if index + 1 < len(hits) else len(text)
-        windows.append((name, text[end:next_start]))
+        windows.append((name, text[end : min(next_start, _sentence_end(text, end))]))
     return windows
 
 
@@ -511,6 +615,8 @@ def _number_findings(
             continue
         if _is_code_fragment(folded, start, end, [*facts, *identity]):
             continue
+        if _same_unit_spacing(folded, end, token, facts):
+            continue
         findings.append(
             GroundingFinding(
                 kind=FindingKind.NUMBER,
@@ -526,18 +632,25 @@ def _number_findings(
 
 
 def _related_attribute(data: GenerationInput, folded: str, start: int, token: str) -> str | None:
-    """Характеристика, к которой текст относит число, и та, чье значение содержит число."""
+    """Характеристика в том же предложении и та, где это число — целый токен значения."""
 
     nearest: tuple[int, str] | None = None
+    sentence_start = _sentence_start(folded, start)
     for item in data.attributes:
         name = fold_technical(item.name.strip())
         if not name:
             continue
         for match in re.finditer(rf"(?<!\w){re.escape(name)}(?!\w)", folded, re.IGNORECASE):
-            if match.end() <= start and (nearest is None or match.end() > nearest[0]):
+            if sentence_start <= match.end() <= start and (
+                nearest is None or match.end() > nearest[0]
+            ):
                 nearest = (match.end(), f"{item.name} = {item.value}")
     containing = next(
-        (f"{item.name} = {item.value}" for item in data.attributes if token in item.value),
+        (
+            f"{item.name} = {item.value}"
+            for item in data.attributes
+            if _token_is_number(fold_technical(item.value), token)
+        ),
         None,
     )
     parts: list[str] = []
@@ -561,12 +674,21 @@ def _number_reason(folded: str, start: int, end: int, token: str, facts: list[st
             )
             break
     else:
-        holder = next((blob for blob in facts if token in blob), None)
-        if holder is not None:
+        text_unit = _unit_at(folded, end)
+        mismatch = _unit_mismatch(token, text_unit, facts)
+        if mismatch is not None:
+            blob, fact_unit = mismatch
             reasons.append(
-                f"число входит в значение «{holder}», но запись в тексте не совпадает с ним "
-                "целиком (другая единица, склейка или перестановка частей)"
+                f"число входит в значение «{blob}», но после него стоит единица "
+                f"«{text_unit}», а не «{fact_unit}» (другая единица)"
             )
+        else:
+            holder = next((blob for blob in facts if _token_is_number(blob, token)), None)
+            if holder is not None:
+                reasons.append(
+                    f"число входит в значение «{holder}», но запись в тексте не совпадает с ним "
+                    "целиком (другая единица, склейка или перестановка частей)"
+                )
     left, right = _code_run(folded, start, end)
     run = folded[left:right].strip("-")
     if any(char.isalpha() for char in run) and run != token:
